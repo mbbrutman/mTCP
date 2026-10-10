@@ -1,7 +1,7 @@
 /*
 
    mTCP Telnet.cpp
-   Copyright (C) 2009-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -127,9 +127,8 @@ UserInputMode_t::e UserInputMode = UserInputMode_t::Telnet;
 
 bool    DebugTelnet = false;   // Are we spitting out messages for telnet?
 bool    DebugAnsi = false;     // Are we spitting out messages for ANSI codes?
-bool    RawOrTelnet = true;    // Are we doing telnet or just raw?
+bool    RawOrTelnet = true;    // Are we doing telnet or just raw?  Default to Telnet.
 uint8_t InitWrapMode = 1;      // Normally we wrap
-uint8_t SendBsAsDel  = 1;
 uint8_t LocalEcho    = 0;      // Is local echoing enabled?
 uint8_t NewLineMode  = 4;      // 0 is CR/LF, 1 is CR, 2 is LF, 3 is CR/NUL and 4 is AUTO
 uint8_t BackScrollPages = 4;
@@ -138,6 +137,10 @@ uint32_t ConnectTimeout = TELNET_CONNECT_TIMEOUT; // How many ms to wait for a c
 
 char TermType[TERMTYPE_MAXLEN] = "ANSI";
 
+// If you are using the Telnet protocol you should send a Telnet EraseChar
+// command.  But everything recognizes DEL or BS so those are generally safe.
+// As a result, our default is DEL.
+uint8_t BackspaceMode = 1;     // 0=Send BS, 1=Send DEL, 2=Send TEL EC
 
 
 
@@ -158,8 +161,8 @@ static uint16_t processSocket_RLE( uint8_t *recvBuffer, uint16_t len );
 static uint16_t processSocket_Sixel( uint8_t *recvBuffer, uint16_t len );
 #endif
 
-extern int16_t  processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize );
-static int16_t  processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBufLen, uint8_t *outputBuf, uint16_t *outputBufLen );
+extern int      processTelnetCmds( uint8_t *cmdStr, int cmdStrSize );
+static int      processSingleTelnetCmd( uint8_t *cmdStr, int inputBufLen, uint8_t *outputBuf, int *outputBufLen );
 
 static uint8_t  processUserInput_TelnetLocal( Key_t key );
 static void     processUserInput_TelnetNonLocal( Key_t key );
@@ -223,7 +226,7 @@ TelnetOpts MyTelnetOpts;
 
 Screen s;
 
-enum StreamStates { Normal = 0, ESC_SEEN, CSI_SEEN, IAC_SEEN, RLE, SIXEL, UTF_START, UTF_MORE };
+enum StreamStates { Normal = 0, ESC_SEEN, CSI_SEEN, IAC_SEEN, RLE, DCS, DCS_DATA, DCS_ESC, SIXEL, UTF_START, UTF_MORE };
 StreamStates StreamState;
 
 
@@ -349,7 +352,7 @@ static char tmpBuf[160];
 
 
 
-static char CopyrightMsg1[] = "mTCP Telnet by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2025\r\n";
+static char CopyrightMsg1[] = "mTCP Telnet by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2026\r\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\r\n\r\n";
 
 int main( int argc, char *argv[] ) {
@@ -479,7 +482,9 @@ int main( int argc, char *argv[] ) {
   s.add( tmpBuf );
 
 
-  sendInitialTelnetOpts( );
+  if ( RawOrTelnet ) {
+    sendInitialTelnetOpts( );
+  }
 
 
   // done is more than a simple flag:
@@ -500,10 +505,7 @@ int main( int argc, char *argv[] ) {
       if ( done == 0 ) done = 1; else done = 3;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
-
+    Utils::processPackets( );
 
     // Process incoming packets first.
     //
@@ -517,9 +519,7 @@ int main( int argc, char *argv[] ) {
 
       int16_t recvRc = mySocket->recv( recvBuffer+bytesInBuffer, bytesToRead-bytesInBuffer );
 
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-      Tcp::drivePackets( );
+      Utils::processPackets( );
 
       if ( recvRc > 0 ) {
 
@@ -764,21 +764,15 @@ void send( uint8_t *userBuf, uint16_t userBufLen ) {
     bytesSent += rc;
 
     if ( rc == 0 ) {
-
       // We had data to send but none was sent; we must be backlogged.  Try
       // to process some packets.
-
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-      Tcp::drivePackets( );
+      Utils::processPackets( );
     }
 
   } // end while
 
   // Drive packets out at the end to speed things up.
-  PACKET_PROCESS_SINGLE;
-  Arp::driveArp( );
-  Tcp::drivePackets( );
+  Utils::processPackets( );
 }
 
 
@@ -826,13 +820,9 @@ uint8_t processUserInput_TelnetLocal( Key_t key ) {
     toggleOnSound( );
   }
   else if ( key.action == K_Alt_B ) {
-    SendBsAsDel = !SendBsAsDel;
-    if ( SendBsAsDel ) {
-      toggleOnSound( );
-    }
-    else {
-      toggleOffSound( );
-    }
+    BackspaceMode++;
+    if ( BackspaceMode > 2 ) BackspaceMode = 0;
+    toggleOnSound( );
   }
   else if ( key.action == K_Alt_H ) {
     doHelp( );
@@ -879,25 +869,27 @@ uint8_t processUserInput_TelnetLocal( Key_t key ) {
 
 void processUserInput_TelnetNonLocal( Key_t key ) {
 
-  // Do a quick pre-check to make sure that we have room in the outgoing packet
-  // queue to send something.  Otherwise, there is no point in reading the
-  // keyboard.
+  // If there is no room in the outgoing packet queue or we can't get a transmit
+  // buffer than quit early.
 
-  if ( mySocket->outgoingQueueIsFull( ) ) return;
-
-
-  // In theory we can send a packet if we need to.  Now get a packet ...  and
-  // if we can't, exit early for the same reason.
-
-  DataBuf *buf = (DataBuf *)TcpBuffer::getXmitBuf( );
-  if ( buf == NULL ) return;
+  DataBuf *buf;
+  if ( (mySocket->outgoingQueueIsFull( )) || ((buf = (DataBuf *)TcpBuffer::getXmitBuf( )) == NULL) ) {
+  // Fixme: Beep here to signify a full buffer?
+    return;
+  }
 
 
-  buf->b.dataLen = 0;
+  // Assume we are echoing nothing.  If there is something that should be
+  // locally echoed, it will be here.
+  uint8_t localEchoChar = 0;
 
-  #ifdef TELNET_UNICODE
-  bool unicodeChar = false;
-  #endif
+  buf->b.setDataLen( 0 );
+
+  // This is a flag we use to force a character to be displayed on the screen
+  // if local echoing is desired, and not interpreted as a control character.
+  // For example, Unicode chars are never to be interpreted as control characters
+  // even though we might be using a control character as the glyph.
+  bool displayAsGlyph = false;
 
   uint8_t sk = key.action;
 
@@ -909,28 +901,22 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
       // If the generated character has the high bit on and Unicode is enabled
       // then send the proper Unicode code point via UTF-8.
 
-      if ( SendBsAsDel ) {
-        if ( key.normalKey == 8 ) {
-          key.normalKey = 127;
-        }
-        else if ( key.normalKey == 127 ) {
-          key.normalKey = 8;
-        }
-      }
-
       #ifdef TELNET_UNICODE
       if ( (key.normalKey > 0x7f) && (Unicode::XlateTableLoaded( ) == true) ) {
         small_cp_t cp = Unicode::charToUnicode( key.normalKey );
-        buf->b.dataLen = Unicode::encodeUTF8( cp, (uint8_t *)buf->data );
-        unicodeChar = true;
+        buf->b.setDataLen( Unicode::encodeUTF8( cp, (uint8_t *)buf->data ) );
+        displayAsGlyph = true;
       } else {
-        buf->b.dataLen = 1;
+        buf->b.setDataLen( 1 );
         buf->data[0] = key.normalKey;
       }
       #else
-      buf->b.dataLen = 1;
+      buf->b.setDataLen( 1 );
       buf->data[0] = key.normalKey;
       #endif
+
+      // Whatever it is, it gets echoed if local echo is on.
+      localEchoChar = key.normalKey;
 
       break;
 
@@ -945,8 +931,9 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
 
     case K_Unicode_CP: {
       if ( Unicode::XlateTableLoaded( ) == true ) {
-        buf->b.dataLen = Unicode::encodeUTF8( key.unicode_cp, (uint8_t *)buf->data );
-        unicodeChar = true;
+        buf->b.setDataLen( Unicode::encodeUTF8( key.unicode_cp, (uint8_t *)buf->data ) );
+        displayAsGlyph = true;
+        localEchoChar = Unicode::findDisplayChar( key.unicode_cp );
       }
       break;
     }
@@ -957,34 +944,34 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
 
       switch ( NewLineMode ) {
         case 0: {
-          buf->b.dataLen = 2;
+          buf->b.setDataLen( 2 );
           buf->data[0] = 0x0D; buf->data[1] = 0x0A;
           break;
         }
         case 1: {
-          buf->b.dataLen = 1;
+          buf->b.setDataLen( 1 );
           buf->data[0] = 0x0D;
           break;
         }
         case 2: {
-          buf->b.dataLen = 1;
+          buf->b.setDataLen( 1 );
           buf->data[0] = 0x0A;
           break;
         }
         case 3: {
-          buf->b.dataLen = 2;
+          buf->b.setDataLen( 2 );
           buf->data[0] = 0x0D; buf->data[1] = 0x00;
           break;
         }
         case 4: {
           if ( MyTelnetOpts.isLclOn( TELOPT_BIN ) ) {
             // Send just a CR
-            buf->b.dataLen = 1;
+            buf->b.setDataLen( 1 );
             buf->data[0] = 0x0D;
           }
           else {
             // Send CR/NUL 
-            buf->b.dataLen = 2;
+            buf->b.setDataLen( 2 );
             buf->data[0] = 0x0D; buf->data[1] = 0x00;
           }
           break;
@@ -992,47 +979,49 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
 
       }
 
+      localEchoChar = 0x0D; // Local echo here is just a carriage return
+
       break;
     }
 
     case K_Backtab: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'Z';
       break;
     }
 
     case K_Home: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'H';
       break;
     }
 
     case K_CursorUp: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'A';
       break;
     }
 
     case K_CursorDown: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'B';
       break;
     }
 
     case K_CursorLeft: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'D';
       break;
     }
 
     case K_CursorRight: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'C';
       break;
     }
 
     case K_Insert: {
-      buf->b.dataLen = 3;
+      buf->b.setDataLen( 3 );
       buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = 'L';
       break;
     }
@@ -1048,37 +1037,52 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
       //buf->b.dataLen = 4;
       //buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = '3'; buf->data[3] = '~';
 
-      buf->b.dataLen = 1;
+      buf->b.setDataLen( 1 );
       buf->data[0] = 127;
       break;
     }
 
+    case K_Backspace: {
+
+      switch ( BackspaceMode ) {
+        case 0: // Backspace
+          buf->data[0] = 0x8;
+          buf->b.setDataLen( 1 );
+          break;
+        case 1: // DEL
+          buf->data[0] = 0x7f;
+          buf->b.setDataLen( 1 );
+          break;
+        case 2: // Telnet EraseChar
+          buf->data[0] = TEL_IAC; buf->data[1] = TELCMD_EC;
+          buf->b.setDataLen( 2 );
+          break;
+      }
+
+      localEchoChar = 0x08;
+    }
+
   } // end switch
+
 
   if ( LocalEcho ) {
 
     // Update screen first before we give the buffer away.
-    // We don't do local echo ANSI strings.  Right now all of
-    // our ANSI strings (and only them) are three bytes long,
-    // so this is an easy way to detect them.
+    // If an local echo character was set explictly use that.
+    // Unicode characters always get echoed and sent to the screen
+    // in a way that they are not interpreted as control codes.
 
-    #ifdef TELNET_UNICODE
-    if ( unicodeChar == true ) {
-      s.addPrintableChar( key.normalKey );
+    if ( displayAsGlyph == true ) {
+      s.addPrintableChar( localEchoChar );
     } else {
-      if ( buf->b.dataLen != 3 ) {
-        s.add( (char *)buf->data, buf->b.dataLen );
+      if ( localEchoChar ) {
+        s.add( (char *)(&localEchoChar), 1);
       }
     }
-    #else
-    if ( buf->b.dataLen != 3 ) {
-      s.add( (char *)buf->data, buf->b.dataLen );
-    }
-    #endif
 
   }
 
-  if ( buf->b.dataLen ) {
+  if ( buf->b.getDataLen( ) ) {
 
     // Send the packet.  We know we had room in the socket outgoing queue so
     // this only fails if the socket is dead.
@@ -1147,9 +1151,7 @@ void resolveAndConnect( void ) {
 
     if ( !Dns::isQueryPending( ) ) break;
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
     Dns::drivePendingQuery( );
 
   }
@@ -1182,9 +1184,7 @@ void resolveAndConnect( void ) {
 
     while ( 1 ) {
 
-      PACKET_PROCESS_SINGLE;
-      Tcp::drivePackets( );
-      Arp::driveArp( );
+      Utils::processPackets( );
 
       if ( mySocket->isConnectComplete( ) ) return;
 
@@ -1211,78 +1211,78 @@ void resolveAndConnect( void ) {
 
 void sendInitialTelnetOpts( void ) {
 
+  // We always want the server to echo and suppress go ahead and we will
+  // ask for this explicitly.
   MyTelnetOpts.setWantRmtOn( TELOPT_ECHO );
   MyTelnetOpts.setWantRmtOn( TELOPT_SGA );
 
+
+  // These are options we are willing to do, but have not turned on yet
+  // because we didn't ask and are going to wait to be asked.
   MyTelnetOpts.setWantLclOn( TELOPT_SGA );
   MyTelnetOpts.setWantLclOn( TELOPT_TERMTYPE );
   MyTelnetOpts.setWantLclOn( TELOPT_WINDSIZE );
 
 
   // If the remote side tells us they are going to BINARY we will allow it
-  // If they tell us to go to BINARY we will allow it too.
+  // If they tell us to go to BINARY we will allow it too.  But we are not
+  // going to explicitly ask for either one.
+
   MyTelnetOpts.setWantRmtOn( TELOPT_BIN );
   MyTelnetOpts.setWantLclOn( TELOPT_BIN );
 
 
-  // Send initial Telnet options
-  if ( RawOrTelnet ) {
+  // Send our request for TELOPT_ECHO and TELOPT_SGA
 
-    MyTelnetOpts.setDoOrDontPending( TELOPT_ECHO );
-    MyTelnetOpts.setDoOrDontPending( TELOPT_SGA );
+  MyTelnetOpts.setDoOrDontPending( TELOPT_ECHO );
+  MyTelnetOpts.setDoOrDontPending( TELOPT_SGA );
 
-    // MyTelnetOpts.setDoOrDontPending( TELOPT_BIN );
-    // MyTelnetOpts.setWillOrWontPending( TELOPT_BIN );
+  // MyTelnetOpts.setDoOrDontPending( TELOPT_BIN );
+  // MyTelnetOpts.setWillOrWontPending( TELOPT_BIN );
 
-    uint8_t output[] = { TEL_IAC, TELCMD_DO, TELOPT_ECHO,
-                         TEL_IAC, TELCMD_DO, TELOPT_SGA };
-    //                   TEL_IAC, TELCMD_DO, TELOPT_BIN,
-    //                   TEL_IAC, TELCMD_WILL, TELOPT_BIN };
+  uint8_t output[] = { TEL_IAC, TELCMD_DO, TELOPT_ECHO,
+                       TEL_IAC, TELCMD_DO, TELOPT_SGA };
+  //                   TEL_IAC, TELCMD_DO, TELOPT_BIN,
+  //                   TEL_IAC, TELCMD_WILL, TELOPT_BIN };
 
-    send( output, sizeof(output) );
-    Tcp::drivePackets( );
-  }
+  send( output, sizeof(output) );
+  Tcp::drivePackets( );
 
 }
 
 
+void getTelnetBinaryMode( bool *local, bool *remote ) {
+  *local = MyTelnetOpts.isLclOn( TELOPT_BIN );
+  *remote = MyTelnetOpts.isRmtOn( TELOPT_BIN );
+}
 
-void setTelnetBinaryMode( bool binaryMode ) {
 
-  if ( !RawOrTelnet ) return;
+void setTelnetBinaryMode( bool desiredLocal, bool desiredRemote ) {
 
+  if ( RawOrTelnet == false ) return;
 
-  // We always try to turn it on/off for both directions at the same time.
-  // Assume it works and only check to see if the local side is on/off.
+  TRACE(( "Telnet: setBinaryMode, current: %0X, next %u %u\n", MyTelnetOpts.optArr[TELOPT_BIN], desiredLocal, desiredRemote ));
 
-  if ( (MyTelnetOpts.isLclOn( TELOPT_BIN ) ? true : false) == binaryMode ) return;
+  uint8_t outputBytes[6];
+  uint8_t outputLen = 0;
 
-  MyTelnetOpts.setDoOrDontPending( TELOPT_BIN );
-  MyTelnetOpts.setWillOrWontPending( TELOPT_BIN );
-
-  uint8_t output[6];
-  output[0] = TEL_IAC;
-  output[2] = TELOPT_BIN;
-  output[3] = TEL_IAC;
-  output[5] = TELOPT_BIN;
-
-  if ( binaryMode == true ) {
-    MyTelnetOpts.setWantRmtOn( TELOPT_BIN );
-    MyTelnetOpts.setWantLclOn( TELOPT_BIN );
-    output[1] = TELCMD_DO;
-    output[4] = TELCMD_WILL;
-  }
-  else {
-    MyTelnetOpts.setWantRmtOff( TELOPT_BIN );
-    MyTelnetOpts.setWantLclOff( TELOPT_BIN );
-    output[1] = TELCMD_DONT;
-    output[4] = TELCMD_WONT;
+  if ( MyTelnetOpts.isLclOn( TELOPT_BIN ) != desiredLocal ) {
+    outputBytes[outputLen++] = TEL_IAC;
+    outputBytes[outputLen++] = desiredLocal ? TELCMD_WILL : TELCMD_WONT;
+    outputBytes[outputLen++] = TELOPT_BIN;
+    MyTelnetOpts.setWillOrWontPending( TELOPT_BIN );
   }
 
-  send( output, 6 );
+  if ( MyTelnetOpts.isRmtOn( TELOPT_BIN ) != desiredRemote ) {
+    outputBytes[outputLen++] = TEL_IAC;
+    outputBytes[outputLen++] = desiredRemote ? TELCMD_DO : TELCMD_DONT;
+    outputBytes[outputLen++] = TELOPT_BIN;
+    MyTelnetOpts.setDoOrDontPending( TELOPT_BIN );
+  }
+
+  send( outputBytes, outputLen );
   Tcp::drivePackets( );
 }
-
 
 
 
@@ -1320,11 +1320,11 @@ HelpMenu_t HelpMenu[] = {
   {36,  7, &scCommandKey, "Alt-W" },
   {42,  7, &scNormal,     "Wrap at right margin On/Off" },
   {10,  8, &scCommandKey, "Alt-B" },
-  {16,  8, &scNormal,     "Send Backspace as Delete On/Off" },
+  {16,  8, &scNormal,     "Toggle Backspace mode" },
   {10,  9, &scCommandKey, "Alt-N" },
   {16,  9, &scNormal,     "Send [Enter] as CR/NUL, CR/LF, CR or LF" },
   { 0, 11, &scNormal,     "Virtual buffer pages:    Echo:       Wrap:      Term type:" },
-  { 0, 12, &scNormal,     "Send Backspace As Delete:      Send [Enter] as:"},
+  { 0, 12, &scNormal,     "Backspace mode:            Send [Enter] as:"},
   {99,  0, 0, ""}
 };
 
@@ -1334,6 +1334,12 @@ char *NewLineModes[] = {
   "LF",
   "CR/NUL",
   "AUTO"
+};
+
+char *BackspaceModes[] = {
+  "Backspace",
+  "DEL",
+  "Telnet EC"
 };
 
 void doHelp( void ) {
@@ -1365,8 +1371,8 @@ void doHelp( void ) {
   s.myCprintf( 31, 11, scToggleStatus, "%s", (LocalEcho?"On":"Off") );
   s.myCprintf( 43, 11, scToggleStatus, "%s", (s.isWrapModeOn( )?"On":"Off") );
   s.myCprintf( 59, 11, scToggleStatus, "%s", TermType );
-  s.myCprintf( 26, 12, scToggleStatus, "%s", (SendBsAsDel?"On":"Off") );
-  s.myCprintf( 48, 12, scToggleStatus, NewLineModes[NewLineMode] );
+  s.myCprintf( 16, 12, scToggleStatus, BackspaceModes[BackspaceMode] );
+  s.myCprintf( 44, 12, scToggleStatus, NewLineModes[NewLineMode] );
 
   uint8_t row = 14;
 
@@ -1522,9 +1528,9 @@ void getCfgOpts( void ) {
     InitWrapMode = InitWrapMode != 0;
   }
 
-  if ( Utils::getAppValue( "TELNET_SENDBSASDEL", tmp, 10 ) == 0 ) {
-    SendBsAsDel = atoi(tmp);
-    SendBsAsDel = SendBsAsDel != 0;
+  if ( Utils::getAppValue( "TELNET_BACKSPACEMODE", tmp, 10 ) == 0 ) {
+    BackspaceMode = atoi(tmp);
+    if (BackspaceMode > 2) BackspaceMode = 1;
   }
 
   if ( Utils::getAppValue( "TELNET_SEND_NEWLINE", tmp, 10 ) == 0 ) {
@@ -1634,7 +1640,6 @@ extern uint8_t rotateRightOnce( uint8_t r );
 static uint16_t SIXEL_screenRow;
 static uint16_t SIXEL_col;
 static uint8_t  SIXEL_bit;
-static bool     SIXEL_initialQ;
 static uint8_t  SIXEL_term_seq;
 
 #endif
@@ -1649,7 +1654,13 @@ static uint8_t  SIXEL_term_seq;
 
 static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
-  uint16_t i;
+  // While the length is passed in as a uint16_t, that is overkill and an int
+  // for the loop works jut fine.  It also allows us to undo processing for
+  // a character by backing up one, even when it's the first character in
+  // the buffer.
+
+  int i;
+
   for ( i=0; i < len; i++ ) {
 
     if ( StreamState == ESC_SEEN ) {
@@ -1676,22 +1687,17 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
       }
       #endif
 
-      #ifdef SIXEL_GRAPHICS
       else if ( recvBuffer[i] == 'P' ) {
-        StreamState = SIXEL;
+        // Device Control String.  We generally ignore these unless we are doing SIXEL.
+        StreamState = DCS;
       }
-      #endif
-
-
 
       else {
-        // Esc char was eaten - return to normal processing.
-
-        StreamState = Normal;
-
         // We can handle simple one character escape sequences without
         // too much drama.
         processNonCSIEscSeq( recvBuffer[i] );
+
+        StreamState = Normal;
       }
 
     }
@@ -1716,7 +1722,7 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
       else {
 
         // It really is a telnet command ...
-        int16_t rc = processTelnetCmds( recvBuffer+i, (len-i) );
+        int rc = processTelnetCmds( recvBuffer+i, (len-i) );
 
         // If a telnet option is processed move 'i' forward the correct
         // number of chars.  Keep in mind that TEL_IAC has already been
@@ -1749,18 +1755,71 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
       StreamState = Normal;
     }
 
+    else if ( StreamState == DCS ) {
+
+      // DCS has the form ESC P p...p i...i f data_string ST
+      //
+      // *  where p are parameters between 0x30 to 0x3F,
+      // *  where i are intermediate characters between 0x20 and 0x2F
+      // *  f is the final character between 0x40 and 0x7e
+      // *  The raw data ...
+      // *  A string terminator (ST) that is ESC backslash
+      //
+      // We have already seen the ESC P and the only device control string
+      // we handle is Sixel.  Our Sixel implementation doesn't care about
+      // parameters or intermediate characters, so eat those until we get
+      // the Sixel final character or a different final character that starts
+      // the data string.
+    
+      if ( (recvBuffer[i] < 0x20) && (recvBuffer[i] > 0x7e) ) {
+        // This is an error; go back to a good state.  Not really, but close enough.
+        // (Not every character in this range is actually an error.)
+        StreamState = Normal;
+      }
+      else if ( (recvBuffer[i] >= 0x20) && (recvBuffer[i] <= 0x3F) ) {
+        // This is a parameter or an intermediate character - do nothing.
+      }
+      else {
+        // This has to be a final character.
+        if ( recvBuffer[i] == 'q' ) {
+          // Sixel will handle the transition back to Normal.
+          StreamState = SIXEL;
+        }
+        else {
+          // Start reading the data string.
+          StreamState = DCS_DATA;
+        }
+      }
+
+    }
+
+    else if ( StreamState == DCS_DATA ) {
+      // We are just eating the data string, as we don't process any DCS
+      // command except for Sixel.
+      if ( recvBuffer[i] == 27 ) {
+        StreamState = DCS_ESC;
+      }
+    }
+
+    else if ( StreamState == DCS_ESC ) {
+      // This is String Terminator, which ends DCS
+      if ( recvBuffer[i] == '\\' ) {
+        StreamState = Normal;
+      }
+    }
+
+
     #ifdef SIXEL_GRAPHICS
 
     else if ( StreamState == SIXEL ) {
 
-      if ( s.getCardType() > 0 ) {
+      if ( s.graphicsAllowed( ) ) {
 
         StreamState = Normal;
 
         SIXEL_screenRow = 0;
         SIXEL_col = 0;
         SIXEL_bit = 0;
-        SIXEL_initialQ = false;
         SIXEL_term_seq = 0;
 
         // Set graphics mode: 640x200 black and white, 1 bit per pixel.
@@ -1777,6 +1836,10 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
         memmove( recvBuffer, recvBuffer+i, (len-i) );
         break;
 
+      } else {
+        // We can't do graphics for some reason, so consume the rest of the
+        // device control string.
+        StreamState = DCS_DATA;
       }
 
     }
@@ -1794,7 +1857,7 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
       // Setup global variables that have our initial state and state
       // in between socket processing calls.
 
-      if ( (s.getCardType() > 0) && (recvBuffer[i] == 'H' || recvBuffer[i] == 'M' || recvBuffer[i] == 'S') ) {
+      if ( s.graphicsAllowed( ) && (recvBuffer[i] == 'H' || recvBuffer[i] == 'M' || recvBuffer[i] == 'S') ) {
 
         if ( recvBuffer[i] == 'H' ) {    // "Hi-Res"
           RLE_x_max = 256;
@@ -1885,15 +1948,17 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
       } else {
 
-        // Whoops ..  this was not supposed to happen.
-        //
-        // Back i up one and break out of the loop, which will force us to
-        // reprocess this character again.
-        //
+        // We thought we were building up a Unicode character but we have a
+        // decode error.  Pretend we were in normal state and add the
+        // characters to the screen so at least the user sees the glitch.
+        // That doesn't help us for interpreting Telnet commands or options
+        // but it is at least visible.
 
+        s.add( (char *)(UTF_chars), UTF_len );
+
+        // Go to Normal state and reprocess this chracter.
         StreamState = Normal;
         i--;
-        break;
       }
 
     }
@@ -1914,14 +1979,21 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
         UTF_expected_len = UTF_remaining_chars_table[ (recvBuffer[i] & 0x38) >> 3 ];
 
-        // If it's not legal UTF-8 then just silently ignore this chacter.  There
-        // are only eight characters it can be and this should not happen.
-        //
-
         if ( UTF_expected_len > 0 ) {
+
+          // Setup to snarf the remaining characters for UTF-8 decode.
+          //
           UTF_chars[0] = recvBuffer[i];
           UTF_len = 1;
           StreamState = UTF_MORE;
+
+        } else {
+
+          // If this is not legal UTF-8 then just print the character as is.
+          // This only happens if we get some binary data that is not supposed
+          // to be in the stream, like the remnants of a binary download.
+
+          s.add( (char *)(recvBuffer+i), 1 );
         }
 
       }
@@ -2006,22 +2078,6 @@ static uint16_t processSocket_Sixel( uint8_t *recvBuffer, uint16_t len ) {
       break;
     }
 
-
-    // SIXEL allows for initial parameters.  We are ignoring them
-    if ( SIXEL_initialQ == false ) {
-      if ( c == 'q' ) {
-        SIXEL_initialQ = true;
-      } else if ( c == 27 ) {
-        // Break out early on any ESC char, whether it's the termination
-        // sequence or not.
-        SIXEL_term_seq = 1;
-        break;
-      }
-      index++;
-      continue;
-    }
-
-
     if ( c >= '?' ) {
 
       if ( col == 0 ) {
@@ -2075,7 +2131,7 @@ static uint16_t processSocket_Sixel( uint8_t *recvBuffer, uint16_t len ) {
 
       uint8_t repeatC = recvBuffer[index] - 63;
 
-      for ( int i=0; i < count; i++ ) {
+      for ( uint16_t i=0; i < count; i++ ) {
         renderSixel( repeatC, screenRow, col, bit );
         col++;
         bit = rotateRightOnce(bit);
@@ -2365,13 +2421,13 @@ static uint16_t processSocket_RLE( uint8_t *recvBuffer, uint16_t len ) {
 
 uint8_t telnetOptionsOutput[ 100 ];
 
-int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
+int processTelnetCmds( uint8_t *cmdStr, int cmdStrSize ) {
 
-  int16_t inputBytesConsumed = 0;
-  uint16_t outputBufLen = 0;;
+  int inputBytesConsumed = 0;
+  int outputBufLen = 0;;
 
-  uint16_t localOutputBufLen;
-  int16_t localInputBytesConsumed = processSingleTelnetCmd( cmdStr, cmdSize, telnetOptionsOutput, &localOutputBufLen );
+  int localOutputBufLen;
+  int localInputBytesConsumed = processSingleTelnetCmd( cmdStr, cmdStrSize, telnetOptionsOutput, &localOutputBufLen );
 
   if (localInputBytesConsumed == 0) {
     // Incomplete input to parse a full Telnet option - return to try again later.
@@ -2382,13 +2438,13 @@ int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
   outputBufLen = localOutputBufLen;
   inputBytesConsumed = localInputBytesConsumed;
   cmdStr += localInputBytesConsumed;
-  cmdSize -= localInputBytesConsumed;
+  cmdStrSize -= localInputBytesConsumed;
 
 
   // Ensure a minimum of 50 chars are available for output from processSingleTelnetCmd.
   // It does not do overflow checking, so it had better fit.
 
-  while ( ((100 - outputBufLen) > 50 ) && (cmdSize > 1) && (*cmdStr == TEL_IAC) ) {
+  while ( ((100 - outputBufLen) > 50 ) && (cmdStrSize > 1) && (*cmdStr == TEL_IAC) ) {
 
     // Another Telnet option!
     //
@@ -2401,7 +2457,7 @@ int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
       }
     }
 
-    localInputBytesConsumed = processSingleTelnetCmd( cmdStr+1, cmdSize-1, telnetOptionsOutput+outputBufLen, &localOutputBufLen );
+    localInputBytesConsumed = processSingleTelnetCmd( cmdStr+1, cmdStrSize-1, telnetOptionsOutput+outputBufLen, &localOutputBufLen );
 
     if ( localInputBytesConsumed == 0 ) {
       // Incomplete input to parse the option; skip this for now.
@@ -2414,7 +2470,7 @@ int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
 
     inputBytesConsumed += localInputBytesConsumed + 1;
     cmdStr += localInputBytesConsumed + 1;
-    cmdSize -= localInputBytesConsumed + 1;
+    cmdStrSize -= localInputBytesConsumed + 1;
 
   }
 
@@ -2442,105 +2498,107 @@ int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
 // having to check each time we add a byte to the output.
 
 // Return codes: n is the number of input bytes consumed
-//               0 if the input buffer was incomplete (try again later)
+//               0 if the input buffer was incomplete, so nothing was consumed
+//                 (try again later)
 //
 // The outputBufLen parm is used a secondary return code.
 
-const char DoOrDontPendingErrMsg[] = "Was waiting for a reply so no response sent\n";
+// Options Negotiation
+//
+// Fixme: consider not answering if the other side is already in the desired
+// state as per RFC 854.  (This is to prevent feedback loops.)  It does not
+// seem to be a problem so I haven't implemented here.
 
-static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint8_t *outputBuf, uint16_t *outputBufLen ) {
+const char DoOrDontPendingErrMsg[] = "Was awaiting a reply, no response sent\n";
 
-  uint8_t localOutputBufLen = 0;
+static int processSingleTelnetCmd( uint8_t *cmdStr, int inputBytes, uint8_t *outputBuf, int *outputBufLen ) {
 
-  // Set return parameter to something sane before getting involved.
   *outputBufLen = 0;
+  int localOutputBufLen = 0;
 
   // Not enough input.
   if ( inputBytes < 1 ) return 0;
 
+  // If debugging is on we'll populate this string.  At the end of the routine it gets traced.
   char debugMsg[120];
-  uint16_t debugMsgLen = 0;
+  int debugMsgLen = 0;
+
 
   // Return code is how many bytes to remove from stream.
-  uint16_t inputBytesConsumed = 1;
+  int inputBytesConsumed = 1;
 
   switch ( cmdStr[0] ) {
 
-
+    // WILL means they are offering to do something.  We can say DO or DONT to the offer.
     case TELCMD_WILL: {
 
       if ( inputBytes < 2 ) return 0;
 
       inputBytesConsumed = 2;
 
-      uint8_t respCmd;
+      uint8_t opt = cmdStr[1];      // Actual command sent from server
+      uint8_t optTableIndex = opt;  // Index into telnet options to look at
+      uint8_t response;
 
-      uint8_t cmd = cmdStr[1];      // Actual command sent from server
-      uint8_t cmdTableIndex = cmd;  // Index into telnet options to look at
-
-      // Protect TelnetOpts class from high numbered options.
-      // If it is too high point at a bogus table entry that has everything
-      // turned off.
-      if ( cmdTableIndex >= TEL_OPTIONS ) cmdTableIndex = TEL_OPTIONS-1;
+      // Protect TelnetOpts class from high numbered options.  If it is too
+      // high point at a bogus table entry that has everything turned off.
+      if ( optTableIndex >= TEL_OPTION_COUNT ) optTableIndex = TELOPT_DUMMY;
 
       if ( DebugTelnet ) {
-        debugMsgLen = sprintf( debugMsg, "Received WILL %u, ", cmd );
+        debugMsgLen = sprintf( debugMsg, "Received WILL %u, ", opt );
       }
 
-      if ( MyTelnetOpts.isWantRmtOn( cmdTableIndex ) ) {
-        respCmd = TELCMD_DO;
-        MyTelnetOpts.setRmtOn( cmdTableIndex );
+      if ( MyTelnetOpts.isWantRmtOn( optTableIndex ) ) {
+        response = TELCMD_DO;
+        MyTelnetOpts.setRmtOn( optTableIndex );
       }
       else {
-        respCmd = TELCMD_DONT;
-        MyTelnetOpts.setRmtOff( cmdTableIndex );
+        response = TELCMD_DONT;
+        MyTelnetOpts.setRmtOff( optTableIndex );
       }
 
-      if ( MyTelnetOpts.isDoOrDontPending( cmdTableIndex ) ) {
-        MyTelnetOpts.clrDoOrDontPending( cmdTableIndex );
+      if ( MyTelnetOpts.isDoOrDontPending( optTableIndex ) ) {
+        MyTelnetOpts.clrDoOrDontPending( optTableIndex );
         if ( DebugTelnet ) {
           debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
         }
       }
       else {
         outputBuf[0] = TEL_IAC;
-        outputBuf[1] = respCmd;
-        outputBuf[2] = cmd;
+        outputBuf[1] = response;
+        outputBuf[2] = opt;
         localOutputBufLen = 3;
         if ( DebugTelnet ) {
-          debugMsgLen += sprintf( debugMsg+debugMsgLen, "Sent %s\n", (respCmd==TELCMD_DO?"DO":"DONT") );
+          debugMsgLen += sprintf( debugMsg+debugMsgLen, "Sent %s\n", (response==TELCMD_DO?"DO":"DONT") );
         }
       }
 
       break;
-
     }
 
 
+    // WONT means they are refusing to do something.  The only valid response is DONT.
     case TELCMD_WONT: {
 
       if ( inputBytes < 2 ) return 0;
 
       inputBytesConsumed = 2;
 
-      uint8_t cmd = cmdStr[1];      // Actual command sent from server
-      uint8_t cmdTableIndex = cmd;  // Index into telnet options to look at
+      uint8_t opt = cmdStr[1];      // Actual command sent from server
+      uint8_t optTableIndex = opt;  // Index into telnet options to look at
 
-      // Protect TelnetOpts class from high numbered options.
-      // If it is too high point at a bogus table entry that has everything
-      // turned off.
-      if ( cmdTableIndex >= TEL_OPTIONS ) cmdTableIndex = TEL_OPTIONS-1;
+      // Protect TelnetOpts class from high numbered options.  If it is too
+      // high point at a bogus table entry that has everything turned off.
+      if ( optTableIndex >= TEL_OPTION_COUNT ) optTableIndex = TELOPT_DUMMY;
 
       if ( DebugTelnet ) {
-        debugMsgLen = sprintf( debugMsg, "Received WONT %u, ", cmd );
+        debugMsgLen = sprintf( debugMsg, "Received WONT %u, ", opt );
       }
 
-      // Our only valid response is DONT
+      MyTelnetOpts.setRmtOff( optTableIndex );
 
-      MyTelnetOpts.setRmtOff( cmdTableIndex );
-
-      if ( MyTelnetOpts.isDoOrDontPending( cmdTableIndex ) ) {
-        MyTelnetOpts.clrDoOrDontPending( cmdTableIndex );
+      if ( MyTelnetOpts.isDoOrDontPending( optTableIndex ) ) {
+        MyTelnetOpts.clrDoOrDontPending( optTableIndex );
         if ( DebugTelnet ) {
           debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
         }
@@ -2548,7 +2606,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
       else {
         outputBuf[0] = TEL_IAC;
         outputBuf[1] = TELCMD_DONT;
-        outputBuf[2] = cmd;
+        outputBuf[2] = opt;
         localOutputBufLen = 3;
         if ( DebugTelnet ) {
           debugMsgLen += sprintf( debugMsg+debugMsgLen, "Sent DONT\n" );
@@ -2559,52 +2617,53 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
     }
 
 
+    // DO means they are asking us to do something.  Valid responses are WILL or WONT.
     case TELCMD_DO: {
 
       if ( inputBytes < 2 ) return 0;
 
       inputBytesConsumed = 2;
 
-      uint8_t respCmd;
+      uint8_t opt = cmdStr[1];      // Actual command sent from server
+      uint8_t optTableIndex = opt;  // Index into telnet options to look at
+      uint8_t response;
 
-      uint8_t cmd = cmdStr[1];      // Actual command sent from server
-      uint8_t cmdTableIndex = cmd;  // Index into telnet options to look at
-
-      // Protect TelnetOpts class from high numbered options.
-      // If it is too high point at a bogus table entry that has everything
-      // turned off.
-      if ( cmdTableIndex >= TEL_OPTIONS ) cmdTableIndex = TEL_OPTIONS-1;
+      // Protect TelnetOpts class from high numbered options.  If it is too
+      // high point at a bogus table entry that has everything turned off.
+      if ( optTableIndex >= TEL_OPTION_COUNT ) optTableIndex = TELOPT_DUMMY;
 
       if ( DebugTelnet ) {
-        debugMsgLen = sprintf( debugMsg, "Received DO   %u, ", cmd );
+        debugMsgLen = sprintf( debugMsg, "Received DO %u, ", opt );
       }
 
-      if ( MyTelnetOpts.isWantLclOn( cmdTableIndex ) ) {
-        respCmd = TELCMD_WILL;
-        MyTelnetOpts.setLclOn( cmdTableIndex );
+      if ( MyTelnetOpts.isWantLclOn( optTableIndex ) ) {
+        response = TELCMD_WILL;
+        MyTelnetOpts.setLclOn( optTableIndex );
       }
       else {
-        respCmd = TELCMD_WONT;
-        MyTelnetOpts.setLclOff( cmdTableIndex );
+        response = TELCMD_WONT;
+        MyTelnetOpts.setLclOff( optTableIndex );
       }
 
-      if ( MyTelnetOpts.isWillOrWontPending( cmdTableIndex ) ) {
-        MyTelnetOpts.clrWillOrWontPending( cmdTableIndex );
+      if ( MyTelnetOpts.isWillOrWontPending( optTableIndex ) ) {
+        MyTelnetOpts.clrWillOrWontPending( optTableIndex );
         if ( DebugTelnet ) {
           debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
         }
       }
       else {
         outputBuf[0] = TEL_IAC;
-        outputBuf[1] = respCmd;
-        outputBuf[2] = cmd;
+        outputBuf[1] = response;
+        outputBuf[2] = opt;
         localOutputBufLen = 3;
         if ( DebugTelnet ) {
-          debugMsgLen += sprintf( debugMsg+debugMsgLen, "Sent %s\n", (respCmd==TELCMD_WILL?"WILL":"WONT") );
+          debugMsgLen += sprintf( debugMsg+debugMsgLen, "Sent %s\n", (response==TELCMD_WILL?"WILL":"WONT") );
         }
       }
 
-      if ( cmd == TELOPT_WINDSIZE && respCmd == TELCMD_WILL ) {
+      // Fire off the Window Size suboption response while we are here.
+
+      if ( opt == TELOPT_WINDSIZE && response == TELCMD_WILL ) {
         outputBuf[3] = TEL_IAC;
         outputBuf[4] = TELCMD_SUBOPT_BEGIN;
         outputBuf[5] = TELOPT_WINDSIZE;
@@ -2617,36 +2676,34 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
         localOutputBufLen = 12;
       }
 
-
       break;
-
     }
 
 
+    // DONT means we shouldn't do something.  The only valid response is WONT.
     case TELCMD_DONT: {
 
       if ( inputBytes < 2 ) return 0;
 
       inputBytesConsumed = 2;
 
-      uint8_t cmd = cmdStr[1];      // Actual command sent from server
-      uint8_t cmdTableIndex = cmd;  // Index into telnet options to look at
+      uint8_t opt = cmdStr[1];      // Actual command sent from server
+      uint8_t optTableIndex = opt;  // Index into telnet options to look at
 
-      // Protect TelnetOpts class from high numbered options.
-      // If it is too high point at a bogus table entry that has everything
-      // turned off.
-      if ( cmdTableIndex >= TEL_OPTIONS ) cmdTableIndex = TEL_OPTIONS-1;
+      // Protect TelnetOpts class from high numbered options.  If it is too
+      // high point at a bogus table entry that has everything turned off.
+      if ( optTableIndex >= TEL_OPTION_COUNT ) optTableIndex = TELOPT_DUMMY;
 
       if ( DebugTelnet ) {
-        debugMsgLen = sprintf( debugMsg, "Received DONT %u, ", cmd );
+        debugMsgLen = sprintf( debugMsg, "Received DONT %u, ", opt );
       }
 
       // Our only valid response is WONT
 
-      MyTelnetOpts.setLclOff( cmdTableIndex );
+      MyTelnetOpts.setLclOff( optTableIndex );
 
-      if ( MyTelnetOpts.isWillOrWontPending( cmdTableIndex ) ) {
-        MyTelnetOpts.clrWillOrWontPending( cmdTableIndex );
+      if ( MyTelnetOpts.isWillOrWontPending( optTableIndex ) ) {
+        MyTelnetOpts.clrWillOrWontPending( optTableIndex );
         if ( DebugTelnet ) {
           debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
         }
@@ -2654,7 +2711,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
       else {
         outputBuf[0] = TEL_IAC;
         outputBuf[1] = TELCMD_WONT;
-        outputBuf[2] = cmd;
+        outputBuf[2] = opt;
         localOutputBufLen = 3;
         if ( DebugTelnet ) {
           debugMsgLen += sprintf( debugMsg+debugMsgLen, "Sent WONT\n" );
@@ -2666,13 +2723,12 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
 
 
 
-
     case TELCMD_SUBOPT_BEGIN: { // Suboption begin
 
       // First thing to do is to find TELCMD_SUBOPT_END
 
-      uint16_t suboptEndIndex = 0;
-      for ( uint16_t i=1; i < inputBytes-1; i++ ) {
+      int suboptEndIndex = 0;
+      for ( int i=1; i < inputBytes-1; i++ ) {
         if ( cmdStr[i] == TEL_IAC && cmdStr[i+1] == TELCMD_SUBOPT_END ) {
           inputBytesConsumed = i + 2;
           suboptEndIndex = i;
@@ -2719,9 +2775,10 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
     case TELCMD_BRK:   // Break (break or attention key hit)
     case TELCMD_IP:    // Interrupt process
     case TELCMD_AO:    // Abort output
+    case TELCMD_GA:    // Go ahead
     {
       if ( DebugTelnet ) {
-        debugMsgLen = sprintf( debugMsg, "Telnet: Ignored command: %u\n", cmdStr[0] );
+        debugMsgLen = sprintf( debugMsg, "Ignored command: %u\n", cmdStr[0] );
       }
       break;
     }
@@ -2736,14 +2793,14 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
 
     default: {
       if ( DebugTelnet ) {
-        debugMsgLen = sprintf( debugMsg, "Telnet: Unprocessed Command: %u\n", cmdStr[0] );
+        debugMsgLen = sprintf( debugMsg, "Unprocessed Command: %u\n", cmdStr[0] );
       }
     }
 
   }
 
   if ( DebugTelnet ) {
-    TRACE(( "%s", debugMsg ));
+    TRACE(( "Telnet: processTelnetCmd: %s", debugMsg ));
   }
 
 
@@ -2776,8 +2833,6 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
 
 static uint16_t processCSISeq( uint8_t *buffer, uint16_t len ) {
 
-
-
   // Used only for debugging/tracing
   //
   uint16_t start_cursor_x = s.cursor_x;
@@ -2805,8 +2860,6 @@ static uint16_t processCSISeq( uint8_t *buffer, uint16_t len ) {
     csiParseState = NoParmsFound;
 
   }
-
-
 
 
   while ( i < len ) {
@@ -2845,23 +2898,38 @@ static uint16_t processCSISeq( uint8_t *buffer, uint16_t len ) {
       csiParseState = ParmsFound;
 
     }
+
+    else if ( (c >= 0x20) && (c <= 0x2f) ) {
+      // Intermediate characters ...  ignore these until the day we need to handle them.
+      // Something in vim is sending them and it's undocumented and irritating.
+      // CSI 0%m in particular.
+    }
+
+    else if ( (c >= 0x40) && (c <= 0x7e) ) {
+      // Command byte
+      if ( csiParseState == ParmsFound && ( parmsFound < CSI_ARGS ) ) parmsFound++;
+      commandLetter = c;
+      i++;
+      break;
+    }
+
     else {
 
-        if ( csiParseState == ParmsFound && ( parmsFound < CSI_ARGS ) ) parmsFound++;
+      // Something unexpected.  Go back to normal state.
+      //
+      // This is an early return!
 
-        commandLetter = c;
-        i++;
-        break;
+      StreamState = Normal;
+      i++;
+      return i;
     }
 
     i++;
 
   } // end while
 
-  bytesProcessed = i;
-
   // Run out of bytes?
-  if ( commandLetter == 0 ) return bytesProcessed;
+  if ( commandLetter == 0 ) return i;
 
   traceBuffer[traceBufferLen] = 0;
   traceBufferLen = 0;
@@ -2889,7 +2957,7 @@ static uint16_t processCSISeq( uint8_t *buffer, uint16_t len ) {
   StreamState = Normal;
 
 
-  return bytesProcessed;
+  return i;
 }
 
 

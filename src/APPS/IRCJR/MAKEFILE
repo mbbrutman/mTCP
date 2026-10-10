@@ -45,6 +45,9 @@ objs = irc.obj screen.obj session.obj $(extra_objs)
 
 all : clean ircjr.exe
 
+install : .symbolic
+	@copy ircjr.exe ..\..\execs
+
 clean : .symbolic
   @del ircjr.exe
   @del *.obj

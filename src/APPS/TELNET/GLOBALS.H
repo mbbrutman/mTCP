@@ -1,7 +1,7 @@
 /*
 
    mTCP Globals.h
-   Copyright (C) 2012-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -103,10 +103,17 @@ extern uint8_t scBright;
 
 
 
-extern int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize );
-extern void setTelnetBinaryMode( bool binaryMode );
+// These need to be exposed for Ymodem integration.
 
-extern bool RawOrTelnet;
+extern bool RawOrTelnet;  // Raw == false, Telnet protocol = true
+
+extern int  processTelnetCmds( uint8_t *cmdStr, int cmdSize );
+
+extern void setTelnetBinaryMode( bool desiredLocal, bool desiredRemote );
+extern void getTelnetBinaryMode( bool *currentLocal, bool *currentRemote );
+
+
+
 
 
 #endif

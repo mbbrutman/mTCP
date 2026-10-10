@@ -1,7 +1,7 @@
 /*
 
    mTCP Trace.cpp
-   Copyright (C) 2005-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -37,6 +37,7 @@
 #include "trace.h"
 
 
+#ifndef NOTRACE
 
 
 FILE     *Trace_Stream = stderr;
@@ -95,3 +96,5 @@ void Trace_tprintf( char *fmt, ... ) {
   Trace_Severity = ' ';
 }
 
+
+#endif

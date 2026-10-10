@@ -1,7 +1,7 @@
 /*
 
    mTCP Ymodem.h
-   Copyright (C) 2012-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -169,6 +169,9 @@ class Transfer_vars {
 
     clockTicks_t lastActivity;
 
+    bool localBinaryMode;
+    bool remoteBinaryMode;
+
     FILE *targetFile;
 
 };
@@ -178,9 +181,6 @@ class Transfer_vars {
 // Globals for Ymodem download
 
 extern Transfer_vars transferVars;
-
-extern char *ExtraFileBuffer;
-
 
 
 #endif

@@ -1,7 +1,7 @@
 /*
 
    mTCP Arp.H
-   Copyright (C) 2005-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -137,6 +137,9 @@ class Arp {
 
     static Pending_t pending[ARP_MAX_PENDING];
     static uint16_t pendingEntries;
+
+    static bool    pointToPointInUse;
+    static uint8_t reserved;
 
 
     // Our Arp cache

@@ -1,7 +1,7 @@
 /*
 
    mTCP NetDrive (SHARED.H)
-   Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 
 
@@ -33,6 +33,7 @@
 // The device driver side doesn't hold as much but it's not needed.
 #define DRIVE_NAME_MAXLEN_DRVSIDE    (40)
 
+#define SHARED_DATA_VERSION (4)
 
 typedef struct {
   uint8_t   media_check_value;                     // 0 (unknown), 1 (no change), or 0xff (changed)
@@ -44,10 +45,13 @@ typedef struct {
   uint16_t  sequence;                              // Sequence number for dupe/lost detection.
   char      remoteName[DRIVE_NAME_MAXLEN_DRVSIDE]; // Might want to drop this.
   uint8_t   BPB[25];                               // BPB of the connected image.
-  char      padding2;
-  uint32_t  blocks_read;
-  uint32_t  blocks_written;
-  uint32_t  retries;
+  uint8_t   max_readahead;                         // Maximum read-ahead blocks.
+  uint8_t   readahead_delay;                       // Desired Delay time in millisconds between RA blocks
+  uint8_t   max_write_size;                        // Maximum write size in blocks.
+  uint16_t  pad;
+  uint32_t  blocks_read;                           // Stats: blocks read
+  uint32_t  blocks_written;                        // Stats: blocks written
+  uint32_t  retries;                               // Stats: commands retried
 } Unit_t;
 
 
@@ -91,10 +95,14 @@ typedef struct {
   uint16_t  timeoutThreshold;        // Could be a uint8_t ...
   uint16_t  retries;                 // Needs to be uint16_t to keep things simple
 
+  uint16_t  my_mtu;                  // MTU for this network
   IpAddr_t  my_ip;                   // This machine's IP, UDP port and MAC.
   uint16_t  my_port;
   EthAddr_t my_mac;
 
+  uint16_t  one_10th_ms;
+  uint16_t  user_send_delay;
+  uint16_t  pkt_send_delay;
 
   // Global stats
 

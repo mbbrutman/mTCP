@@ -1,6 +1,12 @@
 #
 # NetDrv makefile
 #
+# Naming is hard and evolves, so please excuse some of the complications.
+# The key thing is that NETDRV gets compiled and turns into NETDRIVE.EXE
+# and the ASM files turn into NETDRIVE.SYS.
+#
+# Possible compiler options.  We're using the ones to generate compact, but slow code.
+#
 # -oa   Relax alias checking
 # -ob   Try to generate straight line code
 # -oe - expand user functions inline (-oe=20 is default)
@@ -31,26 +37,28 @@ compile_options = -0 $(memory_model) -DCFG_H="netdrv.cfg" -oh -ok -os -s -oa -ei
 compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 
 tcpobjs = packet.obj arp.obj eth.obj ip.obj utils.obj timer.obj ipasm.obj udp.obj dns.obj trace.obj
-objs = netdrv.obj
 
-all : clean netdrv.exe simple.sys rename
+all : clean netdrv.exe nd_cache.exe netdrive.sys rename
+
+install : .symbolic
+	@copy *.sys ..\..\execs
+	@copy *.exe ..\..\execs
 
 rename : .symbolic
 	@rename netdrv.exe netdrive.exe
-	@rename simple.sys netdrive.sys
 
 clean : .symbolic
 	@del netdrv.exe
 	@del netdrive.exe
 	@del netdrive.sys
+	@del nd_cache.exe
 	@del *.obj
 	@del *.map
 	@del *.lst
-	@del simple.exe
-	@del simple.sys
 	@del simple_tmp.asm
 	@del chksum_t.*
 
+# Not used at the moment; use this if you move to the large memory model.
 patch : .symbolic
 	..\..\utils\ptach netdrv.exe netdrv.map $(memory_model)
 
@@ -64,34 +72,39 @@ patch : .symbolic
 .cpp.obj :
 	wpp $[* $(compile_options)
 
-netdrv.exe : $(tcpobjs) $(objs)
+netdrv.exe : $(tcpobjs) netdrv.obj
 	wlink system dos option map option eliminate option stack=4096 name $@ file *.obj
 
+nd_cache.exe : nd_cache.obj
+	wlink system dos option map option eliminate option stack=4096 name $@ file nd_cache.obj
 
-simple.obj :
+
+netdrive.obj :
 	bash fixdate.sh
-	wasm simple_tmp.asm
-	@rename simple_tmp.obj simple.obj
+	@rename simple_tmp.asm netdrive.asm
+	wasm netdrive.asm
+	@del netdrive.asm
 
-simple.sys : simple.obj
-	wlink system dos file simple.obj
-	exe2bin simple.exe simple.sys
-
+netdrive.sys : netdrive.obj
+	wlink system dos file netdrive.obj
+	exe2bin netdrive.exe netdrive.sys
+	@del netdrive.exe
 
 
 # Special binaries for chksum code testing.  These are not normally built.
 
-chksum_test : clean chksum_t.exe chksum_t.sys
+checksum_test : clean chksum_t.sys chksum_t.exe
 
 chksum_t.exe : chksum_test.obj ipasm.obj
 	wlink system dos option map option eliminate option stack=4096 name $@ file chksum_test.obj file ipasm.obj
 
-simple_chksum_test.obj :
+chksum_t.obj :
 	bash fixdate.sh
-	wasm simple_tmp.asm -dCHKSUM_TESTING
-	@rename simple_tmp.obj simple_chksum_test.obj
+	@rename simple_tmp.asm chksum_t.asm
+	wasm chksum_t.asm -dCHKSUM_TESTING
+	@del chksum_t.asm
 
-chksum_t.sys : simple_chksum_test.obj
-	wlink system dos file simple_chksum_test.obj
-	exe2bin simple_chksum_test.exe chksum_t.sys
-	@del simple_chksum_test.exe
+chksum_t.sys : chksum_t.obj
+	wlink system dos file chksum_t.obj
+	exe2bin chksum_t.exe chksum_t.sys
+	@del chksum_t.exe

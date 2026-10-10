@@ -37,6 +37,9 @@ objs = dnstest.obj
 
 all : clean dnstest.exe
 
+install : .symbolic
+	@copy dnstest.exe ..\..\execs
+
 clean : .symbolic
   @del dnstest.exe
   @del *.obj

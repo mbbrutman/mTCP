@@ -38,6 +38,9 @@ objs = pkttool.obj
 
 all : clean pkttool.exe
 
+install : .symbolic
+	@copy pkttool.exe ..\..\execs
+
 clean : .symbolic
   @del pkttool.exe
   @del *.obj

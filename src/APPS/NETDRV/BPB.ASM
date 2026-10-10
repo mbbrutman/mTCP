@@ -1,5 +1,5 @@
 ; mTCP NetDrive (BPB.ASM)
-; Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+; Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
 ; mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 ;
 ;

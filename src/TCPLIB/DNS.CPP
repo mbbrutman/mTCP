@@ -1,7 +1,7 @@
 /*
 
    mTCP Dns.cpp
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -84,17 +84,12 @@ void Dns::flushCache( void ) {
 
 
 int8_t Dns::find( const char *name ) {
-
-  int8_t rc = -1;
-
-  for ( uint8_t i=0; i < entries; i++ ) {
+  for ( int i=0; i < entries; i++ ) {
     if ( stricmp( dnsTable[i].name, name ) == 0 ) {
-      rc = i;
-      break;
+      return i;
     }
   }
-
-  return rc;
+  return -1;
 }
 
 
@@ -208,7 +203,7 @@ static int16_t UDP_max_response = 512;
 int8_t Dns::init( void ) {
 
   if ( Ip::isSame(NameServer, IpInvalid) ) {
-    TRACE_DNS_WARN(( "Dns: NameServer not set\n" ));
+    TRACE_DNS(( "Dns: NameServer not set\n" ));
   }
 
   int8_t rc = Udp::registerCallback( DNS_HANDLER_PORT, &Dns::udpHandler );
@@ -231,9 +226,6 @@ void Dns::stop( void ) {
 }
 
 
-
-
-
 // Resolve
 //
 // Cheap hack alert - if we think that you passed in a numeric IP address
@@ -252,6 +244,9 @@ void Dns::stop( void ) {
 // -3: Bad input
 
 static char fullServerName[DNS_MAX_NAME_LEN];
+
+// Only used by Resolve
+static int near scanHostsFile( const char *target1, const char *target2, IpAddr_t result );
 
 int8_t Dns::resolve( const char *serverName, IpAddr_t target, uint8_t sendReq ) {
 
@@ -291,6 +286,8 @@ int8_t Dns::resolve( const char *serverName, IpAddr_t target, uint8_t sendReq ) 
   int8_t index = find( serverName );
   if ( index != -1 ) {
     Ip::copy( target, dnsTable[index].ipAddr );
+    TRACE_DNS(( "Dns: %s resolved from cache at %d.%d.%d.%d\n",
+                serverName, target[0], target[1], target[2], target[3] ));
     return 0;
   }
 
@@ -321,6 +318,8 @@ int8_t Dns::resolve( const char *serverName, IpAddr_t target, uint8_t sendReq ) 
     index = find( fullServerName );
     if ( index != -1 ) {
       Ip::copy( target, dnsTable[index].ipAddr );
+      TRACE_DNS(( "Dns: %s resolved from cache at %d.%d.%d.%d\n",
+                  fullServerName, target[0], target[1], target[2], target[3] ));
       return 0;
     }
 
@@ -337,9 +336,10 @@ int8_t Dns::resolve( const char *serverName, IpAddr_t target, uint8_t sendReq ) 
   // because if they query again, that is what is most likely to be
   // passed in.
 
-  scanHostsFile( serverName, fullServerName, target );
-  if ( target[0] != 0 ) {
+  if ( scanHostsFile( serverName, fullServerName, target ) ) {
     addOrUpdate( serverName, target );
+    TRACE_DNS(( "Dns: %s or %s resolved from hosts file at %d.%d.%d.%d\n",
+                serverName, fullServerName, target[0], target[1], target[2], target[3] ));
     return 0;
   }
 
@@ -503,7 +503,7 @@ void Dns::sendRequest( IpAddr_t resolver, const char *targetName, uint16_t ident
     if ( Timer_diff( startTime, TIMER_GET_CURRENT( ) ) >
          TIMER_MS_TO_TICKS( DNS_INITIAL_SEND_TIMEOUT ) )
     {
-      TRACE_DNS_WARN(( "Dns: Timeout sending initial request\n" ));
+      TRACE_DNS(( "Dns: Timeout sending initial request\n" ));
       break;
     }
 
@@ -592,10 +592,6 @@ static char *decodeName( DNSpacket *qr, char *current, char *nameBuf ) {
 
   return current;
 }
-
-
-
-
 
 
 
@@ -967,11 +963,11 @@ void Dns::drivePendingQuery1( void ) {
   if ( Timer_diff( pendingQuery.start, TIMER_GET_CURRENT( ) ) > TIMER_MS_TO_TICKS( DNS_TIMEOUT ) ) {
     queryPending = 0;
     lastQueryRc = Timeout;
-    TRACE_DNS_WARN(( "Dns: Timeout finding: %s\n", pendingQuery.originalTarget ));
+    TRACE_DNS(( "Dns: Timeout finding: %s\n", pendingQuery.originalTarget ));
     return;
   }
 
-  TRACE_DNS_WARN(( "Dns: No response, trying again\n" ));
+  TRACE_DNS(( "Dns: Retrying\n" ));
   drivePendingQuery2( );
 
 }
@@ -999,27 +995,35 @@ void Dns::drivePendingQuery2( void ) {
 //
 // Lines starting with are comments.
 // Blank lines are ok.
-// IP addr canonical name [alias] [alias] [...]
+// IP_addr canonical_name [alias] [alias] [...]
+//
+// Call with
+//
+//   target1 is what you are looking for
+//   target2 is a fully qualified version of target1 if target1 was not fully qualified.
+//           If it was fully qualified, then it is the same.
+//
+// Returns
+//   0 - target or target2 not found.
+//   1 - target or target2 are found, and result is filled in.
 
 
 static char lineBuffer[128];
 static char token[DNS_MAX_NAME_LEN];
 
-void Dns::scanHostsFile( const char *target1, const char *target2, IpAddr_t result ) {
+int near scanHostsFile( const char *target1, const char *target2, IpAddr_t result ) {
 
-  result[0] = result[1] = result[2] = result[3] = 0;
-  if ( HostsFilename[0] == 0 ) return;
+  if ( Dns::HostsFilename[0] == 0 ) return 0;
 
-  FILE *hostsFile = fopen( HostsFilename, "r" );
+  FILE *hostsFile = fopen( Dns::HostsFilename, "r" );
   if ( hostsFile == NULL ) {
-    TRACE_DNS_WARN(( "Dns: Error reading hosts file.\n" ));
-    return;
+    TRACE_DNS_WARN(( "Dns: Error opening hosts file.\n" ));
+    return 0;
   }
 
+  int rc = 0;
+
   uint16_t tmp1, tmp2, tmp3, tmp4;
-
-  bool found = false;
-
 
   while ( !feof( hostsFile ) ) {
 
@@ -1027,23 +1031,18 @@ void Dns::scanHostsFile( const char *target1, const char *target2, IpAddr_t resu
       break;
     }
 
-    // printf( "Linebuffer: %s", lineBuffer );
-
     if ( lineBuffer[0] == '#' ) {
-      continue;
+      continue;  // Comment
     }
 
     char *nextTokenPtr = Utils::getNextToken( lineBuffer, token, DNS_MAX_NAME_LEN );
 
     if ( *token == 0 ) {
-      continue;
+      continue;  // Empty line.
     }
 
-
-    int rc = sscanf( token, "%d.%d.%d.%d", &tmp1, &tmp2, &tmp3, &tmp4 );
-    if ( rc != 4 ) {
-      puts( "Skipping invalid IP address in hosts file." );
-      continue;
+    if ( sscanf( token, "%d.%d.%d.%d", &tmp1, &tmp2, &tmp3, &tmp4 ) != 4 ) {
+      continue;  // Invalid IP address
     }
 
     while ( nextTokenPtr ) {
@@ -1053,19 +1052,22 @@ void Dns::scanHostsFile( const char *target1, const char *target2, IpAddr_t resu
         break;
       }
 
-      // printf( "Token: %s\n", token );
+      if ( (stricmp( token, target1 ) == 0) || (stricmp( token, target2) == 0) ) {
 
-      if ( (stricmp( token, target1 ) == 0) || ((*target2 != 0) && (stricmp( token, target2) == 0)) ) {
-        found = true;
         result[0] = tmp1; result[1] = tmp2; result[2] = tmp3; result[3] = tmp4;
-        // printf( "Match: %d.%d.%d.%d\n", tmp1, tmp2, tmp3, tmp4 );
-        break;
+        rc = 1;
+
+        // I never use goto, but in this case I'm not creating another local variable
+        // just to break the loop when I find a target and I need to ensure the file
+        // gets closed.  So here is a goto.  Scream and gnash your teeth ...
+        goto scanHostsDone;
       }
 
     }
 
   }
 
+scanHostsDone:
   fclose( hostsFile );
-
+  return rc;
 }

@@ -39,6 +39,9 @@ objs = nc.obj
 
 all : clean nc.exe
 
+install : .symbolic
+	@copy nc.exe ..\..\execs
+
 clean : .symbolic
   @del nc.exe
   @del *.obj

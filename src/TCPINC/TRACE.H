@@ -1,7 +1,7 @@
 /*
 
    mTCP Trace.H
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -38,6 +38,8 @@
 #include <stdio.h>
 
 #include "types.h"
+
+#include CFG_H
 
 
 

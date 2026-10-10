@@ -1,7 +1,7 @@
 /*
 
    mTCP pkttool.cpp
-   Copyright (C) 2012-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -115,7 +115,7 @@ void ( __interrupt __far *oldCtrlBreakHandler)( );
 const char *BadPacketDriverErrMsg = "Error initializing packet driver - was that the correct software interrupt?";
 const char *BadHandleErrMsg = "Bad handle: Int: 0x%x, Handle: %x\n";
 
-const char CopyrightMsg[] = "\nmTCP pkttool by M Brutman (mbbrutman@gmail.com) (C)opyright 2012-2025\nVersion: " __DATE__ "\n";
+const char CopyrightMsg[] = "\nmTCP pkttool by M Brutman (mbbrutman@gmail.com) (C)opyright 2012-2026\nVersion: " __DATE__ "\n";
 
 int main( int argc, char *argv[] ) {
 
@@ -811,15 +811,17 @@ void genericPacketHandler( uint8_t *packet, uint16_t packetLen ) {
 
     uint16_t op = ntohs( ah->operation );
 
-    if ( Verbose ) {
-      lineBufferOffset += sprintf( lineBufferOffset, "ARP: Request: %s is looking for %s\n",
-                                   printIpAddr( ah->sender_ip, PrintIpAddr_workspace1),
-                                   printIpAddr( ah->target_ip, PrintIpAddr_workspace2) );
-    }
+    if ( op == 1 ) { // ARP request
 
-    IpAddrTable::addToTable( ah->sender_ha, ah->sender_ip );
+      if ( Verbose ) {
+        lineBufferOffset += sprintf( lineBufferOffset, "ARP: Request: %s is looking for %s\n",
+                                     printIpAddr( ah->sender_ip, PrintIpAddr_workspace1),
+                                     printIpAddr( ah->target_ip, PrintIpAddr_workspace2) );
+      }
 
-    if ( op == 2 ) { // ARP response
+      IpAddrTable::addToTable( ah->sender_ha, ah->sender_ip );
+
+    } else if ( op == 2 ) { // ARP response
 
       if ( Verbose ) {
         lineBufferOffset += sprintf( lineBufferOffset, "ARP: Response: %s is %s\n",
@@ -868,6 +870,8 @@ void genericPacketHandler( uint8_t *packet, uint16_t packetLen ) {
 
   // Write lineBuffer before Utils::dumpBytes goes to use it.
   fwrite( lineBuffer, 1, (lineBufferOffset - lineBuffer), OutputFile );
+
+  fflush( NULL );
 
   if ( RawPackets ) {
     uint16_t bytes = packetLen;
@@ -923,6 +927,8 @@ int listenForPackets( uint16_t softwareInt ) {
     oldReceiveMode = Packet_getReceiveMode( );
     if ( Packet_setReceiveMode( 6 ) ) {
       puts( "Warning - failed to set promiscuous mode on your Ethernet card.\n" );
+    } else {
+      puts( "Ethernet adapted switched to promiscuous mode." );
     }
   } else {
     puts( "Warning: Not attempting to put your card in promiscuous mode.\n" );

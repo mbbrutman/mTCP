@@ -1,5 +1,5 @@
 mTCP source code
-2025-01-10 Version
+2026-10-10 Version
 Michael Brutman (mbbrutman@gmail.com)
 
 Home page: http://www.brutman.com/mTCP/mTCP.html
@@ -15,10 +15,6 @@ Welcome to the mTCP source code!
   what compiler to use, architecture and design notes, and miscellaneous
   notes for programming under DOS.
 
-  Note: HTTPServ source code is not provided at this time.  It is a very
-  complex piece of code and even though it is stable, I'd like to fix
-  a few things to make it more robust.
-
 
 Support
 
@@ -29,16 +25,16 @@ Support
 
   The latest mTCP code and documentation can always be found at
   the home page listed above.  That is the official homepage for mTCP
-  that I maintain.  Other sites may have mTCP available for download but
-  I don't attempt to audit or verify those versions and they might be
-  stale or have changes that I don't know about.  (Or they might have some
-  really great code too ...)
+  that I maintain.  I also have mTCP available on GitHub at
+  https://github.com/mbbrutman/mTCP.  Other sites may have copies
+  or forks of mTCP posted; I can't track them all.  If you have an issue
+  with a derivative work please contact that author and if necessary
+  they can contact me.
 
   If you are running an older version of mTCP please try the latest
   version first before contacting me; your problem might be a bug
   that has already been fixed.  You can use SERVICES.BAT to do a quick
   check to see if a new version is available right from your DOS machine.
-
 
   Don't understand the documentation?  That might be my fault.  Send me
   an email with your question and I'll try to make it more clear.
@@ -84,9 +80,11 @@ Licensing
   a different license.
 
   The source code is available at (you guessed it!) the mTCP home page
-  listed above.  It may be mirrored at other places but I don't have
-  any control over those copies and I don't attempt to audit them or
-  verify them.
+  listed above and in my GitHub repository at
+  https://github.com/mbbrutman/mTCP.  Other sites may have copies
+  or forks of mTCP posted; I can't track them all.  If you have an issue
+  with a derivative work please contact that author and if necessary
+  they can contact me.
 
   This code is free to use.  There is no warranty of any kind.  While I
   take pride in my work, this is a hobby project so if it burns down your

@@ -1,7 +1,7 @@
 /*
 
    mTCP NetDrive (CHKSUM_TEST.CPP)
-   Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 
 
@@ -27,7 +27,7 @@
    the device driver that has some extra hooks for this program to use.
    Build the chksum_test target, install it, and then run this program.
    To keep things simple remove NETDRIVE.SYS from the test system
-   temporarily and only plan on doing checksum testing; even thoough
+   temporarily and only plan on doing checksum testing; even though
    all of the code is present the extra hooks move things around and make
    this incompatible with the command line program.
 
@@ -103,12 +103,17 @@ void doTest( void );
 
 // Signature to verify we have found the NetData structure in memory.
 // The last two bytes are the major and minor revision numbers.
-static const char Signature[] = {'N', 'E', 'T', 'D', 'R', 'I', 'V', 'E', 0x00, 0x03};
+static const char Signature[] = {'N', 'E', 'T', 'D', 'R', 'I', 'V', 'E', 0x00, 0x04};
 
 
 int main( int argc, char *argv[] ) {
 
-  puts( "mTCP Netdrive Checksum routine test code." );
+  puts( "mTCP Netdrive Checksum routine test code, (C)opyright 2008-2026 M Brutman\n" );
+
+  if ( argc < 2 ) {
+    puts("Specify a NetDrive drive letter so the test can call the device driver.");
+    exit(1);
+  }
 
   TargetDriveLetter = argv[1][0];
   if ( TargetDriveLetter >= 'A' && TargetDriveLetter <= 'Z') {
@@ -168,7 +173,7 @@ int main( int argc, char *argv[] ) {
 }
 
 
-uint8_t tp[1400];
+uint8_t tp[4096+100];
 
 
 
@@ -179,7 +184,7 @@ extern uint16_t testIpFunc(uint8_t far *);
   "push ss"              \
   "pop ds"               \
   "call testIpFuncPtr"   \
-  modify [bx cx]      \
+  modify [bx cx]         \
   value [ax]             \
   parm [si];
 
@@ -188,11 +193,12 @@ void far *testUdpFuncPtr;
 
 extern uint16_t testUdpFunc(uint8_t far *);
 #pragma aux testUdpFunc = \
-  "push ss"              \
-  "pop ds"               \
+  "push ss"               \
+  "pop ds"                \
+  "xor ax, ax"            \
   "call testUdpFuncPtr"   \
-  modify [bx cx]      \
-  value [ax]             \
+  modify [bx cx]          \
+  value [ax]              \
   parm [si];
 
 
@@ -214,6 +220,8 @@ void doTest( void ) {
   puts( "\nPress a key to stop." );
 
   uint32_t tests = 0;
+  uint32_t largestPayload = 0;
+
   while ( 1 ) {
 
     if ( biosIsKeyReady( ) ) {
@@ -225,8 +233,10 @@ void doTest( void ) {
     // Generate random crap in the packet
 
     int ip_options_len = (rand( ) % 5) * 4;
-    int udp_payload_len = rand( ) % 1024;
+    int udp_payload_len = rand( ) % 4096 + 1;
     int total_len = 20 + 8 + ip_options_len + udp_payload_len;
+
+    if ( largestPayload < udp_payload_len ) largestPayload = udp_payload_len;
 
     // printf( "IP options len: %d, UDP len: %d\n", ip_options_len, udp_payload_len );
 
@@ -309,6 +319,7 @@ void doTest( void ) {
   }
 
   printf("Tests executed: %ld\n", tests);
+  printf("Largest UDP payload: %u bytes\n", largestPayload);
 
 }
 

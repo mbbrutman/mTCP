@@ -1,7 +1,7 @@
 /*
 
    mTCP Utils.H
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -229,8 +229,13 @@ class Utils {
     // of the sockets are closed and all buffers are returned before calling
     // this.  But it should be safe even if you did not.
     //
-    static inline void endStack( void ) { endStack2( false ); }
-    static void        endStack2( bool ignoreTracing );
+    static void        endStack( void );
+
+
+    // Sometimes you don't care to inline the code in the PACKET_PROCESS macros
+    // because what you are doing just isn't that performance sensitive.  Here
+    // is an outline function you can use instead.
+    static void     processPackets( void );
 
 
     // Dump stats for TCP, IP, and the Packet layer
@@ -240,10 +245,8 @@ class Utils {
     // Generic utility functions
     //
     static void      dumpBytes( FILE *stream, unsigned char *, unsigned int );
-    static uint32_t  timeDiff( DosTime_t startTime, DosTime_t endTime );
     static char     *getNextToken( char *input, char *target, uint16_t bufLen );
     static bool      rtrim( char *nullTerminatedString );
-    static int       mystrncpy( char *target, const char *source, uint16_t bufLen );
 
 
     // Used by the DHCP client to set the desired packet software interrupt

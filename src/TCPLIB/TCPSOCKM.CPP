@@ -1,7 +1,7 @@
 /*
 
    mTCP TcpSockM.cpp
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -52,12 +52,13 @@
 #endif
 #include <string.h>
 
+#include "tcp.h"
+#include "tcpsockm.h"
+
 #include "timer.h"
 #include "trace.h"
 #include "utils.h"
 
-#include "tcp.h"
-#include "tcpsockm.h"
 
 
 
@@ -99,7 +100,7 @@ int8_t TcpSocketMgr::init( uint8_t maxSockets ) {
   }
 
   // Allocate memory for socket data structures
-  TcpSocket *socketsMemPtr = (TcpSocket *)malloc( maxSockets * sizeof( TcpSocket ) );
+  TcpSocket *socketsMemPtr = (TcpSocket *)mTCP_malloc( maxSockets * sizeof( TcpSocket ), "LIB_TCP_Sockets" );
   if ( socketsMemPtr == NULL ) {
     allocatedSockets = 0;
     TRACE_TCP_WARN(( "Tcp: Mem alloc err creating socket pool\n" ));
@@ -146,7 +147,7 @@ TcpSocket *TcpSocketMgr::getSocket( void ) {
   TcpSocket *rc = availSocketTable[availSockets];
   rc->reinit( );
 
-  TRACE_TCP(( "Tcp: (%08lx) Socket from free list\n", rc ));
+  TRACE_TCP(( "Tcp: (%p) Allocated socket from free list\n", rc ));
 
   return rc;
 }
@@ -160,7 +161,7 @@ int8_t TcpSocketMgr::freeSocket( TcpSocket *target ) {
     return TCP_RC_BAD;
   }
 
-  TRACE_TCP(( "Tcp: (%08lx) Socket returned to free list\n", target ));
+  TRACE_TCP(( "Tcp: (%p) Socket returned to free list\n", target ));
 
   availSocketTable[availSockets] = target;
   availSockets++;
@@ -204,7 +205,7 @@ TcpSocket *TcpSocketMgr::accept( void ) {
 
       if ( Timer_diff( socketTable[i]->lastActivity, TIMER_GET_CURRENT( ) ) > TIMER_MS_TO_TICKS(TCP_PA_TIMEOUT) ) {
 
-        TRACE_TCP_WARN(( "Tcp: (%08lx) Was pending accept, timed out\n", socketTable[i] ));
+        TRACE_TCP_WARN(( "Tcp: (%p) Was pending accept, timed out\n", socketTable[i] ));
 
         // Probably should attempt a close first, then a destroy, but
         // I'm not wasting the extra code on it.
@@ -234,7 +235,7 @@ TcpSocket *TcpSocketMgr::accept( void ) {
 
         rc->lastActivity = TIMER_GET_CURRENT( );
 
-        TRACE_TCP(( "Tcp: (%08lx) Accepted new socket, pendingAccepts=%u\n",
+        TRACE_TCP(( "Tcp: (%p) Accepted new socket, pendingAccepts=%u\n",
                     rc, pendingAccepts ));
         break;
       }
@@ -271,7 +272,7 @@ void TcpSocketMgr::makeActive( TcpSocket *target ) {
     activeSockets++;
   }
   else {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Tried to make a socket active twice\n", target ));
+    TRACE_TCP_WARN(( "Tcp: (%p) Tried to make a socket active twice\n", target ));
   }
 }
 

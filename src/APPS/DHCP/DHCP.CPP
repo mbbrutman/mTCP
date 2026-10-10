@@ -1,7 +1,7 @@
 /*
 
    mTCP Dhcp.cpp
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -102,8 +102,7 @@ IpAddr_t PreferredNameServer;
 uint32_t OfferedLeaseTime = 0;
 
 
-// These are responses from the router.  Interesting, but we don't do anything
-// with them.
+// These are responses from the router.
 char Domain_assigned[40] = "";
 char Hostname_assigned[40] = "";
 
@@ -159,7 +158,7 @@ int printIpAddr( FILE *stream, const char *name, IpAddr_t addr ) {
 
 
 const char *DhcpMsgName[] = {
-  "",
+  "(not set)",
   "Discover",
   "Offer",
   "Request",
@@ -167,12 +166,13 @@ const char *DhcpMsgName[] = {
   "Ack",
   "NAck",
   "Release",
-  "Inform"
+  "Inform",
+  "(invalid)"
 };
 
 const char *CheckYourCabling_msg = "Check your cabling and packet driver settings, including the hardware IRQ.";
 
-static char *CopyrightMsg = "mTCP DHCP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2025\nVersion: " __DATE__ "\n\n";
+static char *CopyrightMsg = "mTCP DHCP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2026\nVersion: " __DATE__ "\n\n";
 
 
 
@@ -665,8 +665,7 @@ int8_t parseEnv( void ) {
 
 
 
-// Initial settings for DHCPDISCOVER.  This packet
-// gets reused on the DHCPREQUEST.
+// Initial settings for DHCPDISCOVER.  This packet gets reused on the DHCPREQUEST.
 
 uint16_t setupReqPacket( void ) {
 
@@ -750,6 +749,9 @@ void udpHandler(const unsigned char *packet, const UdpHeader *udp ) {
 
 // Remember, we are not getting here unless we get a UDP packet on
 // the right port.  But we still have to make sure it is a reply for us.
+//
+// Error handling: If we don't like something, just execute a return.
+// If you make it to the bottom of the function then all is good.
 
 void udpHandler2( Dhcp_t *resp ) {
 
@@ -767,7 +769,6 @@ void udpHandler2( Dhcp_t *resp ) {
     return;
   }
 
-
   // Check magic cookie in options
   if ( (resp->optionsCookie[0] !=  99) ||
        (resp->optionsCookie[1] != 130) ||
@@ -778,58 +779,12 @@ void udpHandler2( Dhcp_t *resp ) {
     return;
   }
 
-  if ( resp->options[0] != 53 ) {
-    TRACE_WARN(( "Dhcp: first option was not a Dhcp msg type\n" ));
-    return;
-  }
-
-  uint8_t dhcpMsgType = resp->options[2];
-
-  if ( (dhcpMsgType == 0) || (dhcpMsgType > 8) ) {
-    TRACE_WARN(( "Dhcp: Invalid msg type" ));
-    return;
-  }
-
-  TRACE(( "Dhcp msg type: %s\n", DhcpMsgName[dhcpMsgType] ));
-
-  switch ( dhcpMsgType ) {
-
-    case 2: { // DHCPOFFER
-      printf( "Offer received, " );
-      DhcpStatusFlag = Dhcp_Offer;
-      break;
-    }
-
-    case 4: { // DHCPDECLINE
-      puts( "Declined" );
-      DhcpStatusFlag = Dhcp_Declined;
-      return;
-    }
-
-    case 5: { // DHCPACK
-      puts( "Acknowledged" );
-      DhcpStatusFlag = Dhcp_Ack;
-      break;
-    }
-
-    case 6: { // DHCPNAK
-      puts( "Negative - Rejected!" );
-      DhcpStatusFlag = Dhcp_Nack;
-      return;
-    }
-
-    default: {
-      // Discover and Request would be illegal here.
-      // We don't handle Release or Inform.
-      return;
-    }
-
-  }
+  uint8_t dhcpMsgType = 0; // Message type not seen yet.  Error if this is not set.
 
 
   // Parse the received options.
 
-  uint16_t current = 3;
+  uint16_t current = 0;
 
   uint8_t done = 0;
 
@@ -844,6 +799,61 @@ void udpHandler2( Dhcp_t *resp ) {
         TRACE(( "Dhcp Option:  51 Lease time: %lu seconds\n", OfferedLeaseTime ));
         break;
       }
+
+      case 53: { // DHCP mssage Type
+
+        current++;
+        if ( resp->options[current] != 1 ) {
+          TRACE_WARN(( "Dhcp Option: 53, bad length: %u\n", resp->options[current] ));
+          return;
+        }
+
+        current++;
+        dhcpMsgType = resp->options[current];
+        current++;
+
+        uint8_t msgNum = dhcpMsgType;
+        if ( msgNum > 8 ) msgNum = 9;
+        TRACE(( "Dhcp Option:  53, message type: %s\n", DhcpMsgName[msgNum] ));
+
+        switch ( dhcpMsgType ) {
+
+          case 2: { // DHCPOFFER
+            printf( "Offer received, " );
+            DhcpStatusFlag = Dhcp_Offer;
+            break;
+          }
+
+          case 4: { // DHCPDECLINE
+            puts( "Declined" );
+            DhcpStatusFlag = Dhcp_Declined;
+            return;
+          }
+
+          case 5: { // DHCPACK
+            puts( "Acknowledged" );
+            DhcpStatusFlag = Dhcp_Ack;
+            break;
+          }
+
+          case 6: { // DHCPNAK
+            puts( "Negative - Rejected!" );
+            DhcpStatusFlag = Dhcp_Nack;
+            return;
+          }
+
+          default: {
+            // Discover and Request would be illegal here.
+            // We don't handle Release or Inform.
+            TRACE_WARN(( "Dhcp: Message type not handled: %u\n", dhcpMsgType ));
+            return;
+          }
+
+        }
+
+        break;
+
+      } // end case 53
 
       case 54: { // Server identity
         ServerIdentity[0] = resp->options[current+2];
@@ -947,12 +957,17 @@ void udpHandler2( Dhcp_t *resp ) {
         current += 2 + resp->options[current+1];
       }
 
-
     } // end switch options
-
 
   } // end while options
 
+
+  if ( dhcpMsgType == 0 ) {
+    // Error - the sent us something but the DHCP message type was not
+    // sent in an option.  We can't use this.
+    TRACE_WARN(( "Dhcp: Message type option missing\n" ));
+    return;
+  }
 
   // We also need this, but it is from the message body and not the
   // DHCP options.
@@ -960,7 +975,6 @@ void udpHandler2( Dhcp_t *resp ) {
   NewIpAddr[1] = resp->yourIpAddr[1];
   NewIpAddr[2] = resp->yourIpAddr[2];
   NewIpAddr[3] = resp->yourIpAddr[3];
-
 
   if ( dhcpMsgType == 2 ) { // DHCP Offer message
 
@@ -975,7 +989,6 @@ void udpHandler2( Dhcp_t *resp ) {
     Ip::copy( Gateway, GatewayAddr );
 
   }
-
 
 }
 

@@ -1,7 +1,7 @@
 /*
 
    mTCP NetDrive (NETDRV.CPP)
-   Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 
 
@@ -32,6 +32,7 @@
 #include <time.h>
 
 #include <malloc.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,7 @@
 
 #include "REQHDR.H"
 #include "SHARED.H"
+#include "ASMINC.H"
 
 
 
@@ -65,13 +67,16 @@
 
 
 
-#define SERVER_PROTOCOL_VERSION (2)
+#define SERVER_PROTOCOL_VERSION (3)
 
 // Command line parameters
 char     TargetServerAddrName[SERVER_NAME_MAXLEN];   // Target server name
 IpAddr_t TargetServerAddr;                           // Target server Ip address
 uint16_t TargetServerPort = 0;                       // Target server port
 char     TargetDriveName[DRIVE_NAME_MAXLEN];         // Drive to connect to, includes NUL at end
+
+int      readAheadParm = -1;                         // Readahead, in KB
+int      maxWriteParm = -1;                          // Max write size in KB
 
 // If you are doing goto_cp and a Tag is specified, then TagNum is 0.
 // If TagNum is non-zero then use that.
@@ -82,8 +87,11 @@ bool     TagDelMarker = false;
 uint8_t  TargetDriveLetter = 0;                      // A=1, B=2, C=3, ... (0 is invalid)
 bool     ReadOnly = false;
 
-uint16_t TimeoutTicks = 2*18;
+uint16_t TimeoutTicks = 18;
 uint16_t TimeoutRetries = 3;
+
+uint16_t UserSendDelay = 0xffff;
+
 
 // 0 = not set, 1 = connect, 2 = disconnect, 3 = status, 4 = mark cp, 5 = goto cp, 6 = list cp
 int Operation = 0;
@@ -93,6 +101,14 @@ uint16_t OurPort = 0;
 
 
 uint8_t SecondaryPDMsg = 0;
+
+int Verbose = 0;
+
+
+int DetectedCPU;
+const char *CpuStrings[] = {"8088", "80286", "80386", "80486+"};
+
+const char DOS_11_BPB_formatStr[] = "Detected DOS 1.x %uKB floppy image without a BPB.\n";
 
 
 // Memory model notes
@@ -129,73 +145,6 @@ uint8_t SecondaryPDMsg = 0;
 
 
 
-// IOCTL pragmas
-//
-// Usage:
-//
-//  int rc = ioctl_read( netHandle, sizeof(net_data), &net_data );
-//  int rc = ioctl_write( netHandle, sizeof(Net_data_t), &net_data );
-//
-// Returns 0 if an error or the number of bytes read if successful.
-//
-// Memory model note: The IOCTL call wants the buffer to be in ds:dx.  We're
-// using the small memory model so the compiler doesn't recognize ds.  Help
-// it out by setting up ds to be the same as the stack segment.
-
-#if defined(__SMALL__) || defined(__MEDIUM__)
-
-extern uint16_t ioctl_read( uint8_t handle, uint16_t len, void far * buf);
-#pragma aux ioctl_read = \
-  "mov ax, ss"           \
-  "mov ds, ax"           \
-  "mov ax, 4404h"        \
-  "int 21h"              \
-  "jnc ioctl_read1"      \
-  "mov ax, 0"            \
-  "ioctl_read1:"         \
-  parm [bl] [cx] [dx]    \
-  modify [ax]            \
-  value  [ax];
-
-extern uint16_t ioctl_write( uint8_t handle, uint16_t len, void far * buf );
-#pragma aux ioctl_write = \
-  "mov ax, ss"           \
-  "mov ds, ax"           \
-  "mov ax, 4405h"        \
-  "int 21h"              \
-  "jnc ioctl_write1"     \
-  "mov ax, 0"            \
-  "ioctl_write1:"        \
-  parm [bl] [cx] [dx] \
-  modify [ax]            \
-  value  [ax];
-
-#else
-
-extern uint16_t ioctl_read( uint8_t handle, uint16_t len, void far * buf);
-#pragma aux ioctl_read = \
-  "mov ax, 4404h"        \
-  "int 21h"              \
-  "jnc ioctl_read1"      \
-  "mov ax, 0"            \
-  "ioctl_read1:"         \
-  parm [bl] [cx] [ds dx] \
-  modify [ax]            \
-  value  [ax];
-
-extern uint16_t ioctl_write( uint8_t handle, uint16_t len, void far * buf );
-#pragma aux ioctl_write = \
-  "mov ax, 4405h"        \
-  "int 21h"              \
-  "jnc ioctl_write1"     \
-  "mov ax, 0"            \
-  "ioctl_write1:"        \
-  parm [bl] [cx] [ds dx] \
-  modify [ax]            \
-  value  [ax];
-
-#endif
-
 
 
 Net_data_t far *net_data;
@@ -228,6 +177,7 @@ typedef struct {
   uint8_t     Result;
   uint32_t    StartSec;
   uint16_t    SecCount;
+  uint16_t    CmdExt;
 } Command_Packet_t;
 
 
@@ -295,7 +245,7 @@ static const BPB_t DOS_1_320KB = {512, 2, 1, 2, 112, 640, 0xff, 1, 8, 2, 0, 0};
 
 // Signature to verify we have found the NetData structure in memory.
 // The last two bytes are the major and minor revision numbers.
-static const char Signature[] = {'N', 'E', 'T', 'D', 'R', 'I', 'V', 'E', 0x00, 0x03};
+static const char Signature[] = {'N', 'E', 'T', 'D', 'R', 'I', 'V', 'E', 0x00, SHARED_DATA_VERSION};
 
 
 // Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
@@ -308,21 +258,24 @@ void __interrupt __far ctrlBreakHandler( ) {
 }
 
 
+void localEndStack( );
+void connectNetDriveToPD( void );
 
-int  doConnect( void );
-int  doConnect_internal( void );
+void doConnect( void );
 void doDisconnect( void );
 void doStatus( void );
 void doMarkChkp( void );
 void doGotoChkp( void );
 void doListChkp( void );
+void doSetReadAhead( void );
+void doSetMaxWriteSize( void );
+void doSetSendDelay( bool silent );
 void parseArgs( int argc, char *argv[] );
 
 
 
 
-static char *CopyrightMsg = "mTCP NetDrive by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2025\nVersion: " __DATE__ "\n\n";
-static char *NoConnectedDrives = "No connected drives";
+static char *CopyrightMsg = "mTCP NetDrive by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2026\nVersion: " __DATE__ "\n\n";
 
 int main( int argc, char *argv[] ) {
 
@@ -330,6 +283,7 @@ int main( int argc, char *argv[] ) {
 
   parseArgs( argc, argv );
 
+  DetectedCPU = getCPUType( );
 
   // We use IOCTL to get a pointer to the net_data structure and the unit the
   // user wants to manipulate.
@@ -370,11 +324,13 @@ int main( int argc, char *argv[] ) {
 
   if (match == false) {
     puts( "Error: Version mismatch between this program and the NetDrive device driver." );
-    exit(1);
-  }
+      exit(1);
+    }
 
-  printf( "NetDrive device opened, IOCTL_read return code: %x %04X:%04X %04X:%04X\n\n",
-      rc, FP_SEG(net_data), FP_OFF(net_data), FP_SEG(curr_unit), FP_OFF(curr_unit) );
+  if ( Verbose ) {
+    printf( "NetDrive device opened, IOCTL_read data: %04X:%04X %04X:%04X\n\n",
+            FP_SEG(net_data), FP_OFF(net_data), FP_SEG(curr_unit), FP_OFF(curr_unit) );
+  }
 
 
   // Sleazy - see if we need to set the timeout or retry values.
@@ -397,57 +353,50 @@ int main( int argc, char *argv[] ) {
     }
   }
 
-
   if ( Operation == 3 ) {
     doStatus( );
+    return 0;
+  }
+
+
+  // For most remaining operations we are going to be using the nework
+  // so set it up now.
+  if ( Utils::parseEnv( ) != 0 ) { exit(1); }
+
+  if (MyMTU < 1200) {
+    printf("Your MTU setting of %u is below the minimum requirement of 1200.\n"
+           "Please update your MTU setting in the mTCP config file.\n", MyMTU);
+    exit(1);
+  }
+
+  if ( Operation == 1 ) {
+    doConnect( );
   } else {
-
-    if ( Utils::parseEnv( ) != 0 ) { exit(1); }
-
-    /*
-    Utils::openCfgFile( );
-    char packetIntParm[10];
-    if ( Utils::getAppValue("ND_PACKETINT", packetIntParm, 9) != 0 ) {
-      puts("ND_PACKETINT not specified or a bad format.");
-      exit(1);
-    }
-    uint8_t nd_packetInt;
-    int rc = sscanf( packetIntParm, "%x", &nd_packetInt );
-    if ( rc != 1 ) {
-      puts("ND_PACKETINT has a bad format.");
-      exit(1);
-    }
-
-    Utils::setPacketInt( nd_packetInt );
-    */
-
-
-    if (MyMTU < 1200) {
-      printf("Your MTU setting of %d is below the minimum requirement of 1200.\n"
-             "Please update your MTU setting in the mTCP config file.\n", MyMTU);
-      exit(1);
-    }
-
-    if ( Operation == 1 ) {
-      doConnect( );
-    } else {
     
-      if ( curr_unit->session == 0 ) {
-        puts( NoConnectedDrives );
-      } else {
+    if ( curr_unit->session == 0 ) {
+      puts( "That drive is not connected." );
+    } else {
 
-        switch (Operation) {
-          case 2: { doDisconnect( ); break; }
-          case 4: { doMarkChkp( ); break; }
-          case 5: { doGotoChkp( ); break; }
-          case 6: { doListChkp( ); break; }
-        }
-
+      switch (Operation) {
+        case 2: { doDisconnect( ); break; }
+        case 4: { doMarkChkp( ); break; }
+        case 5: { doGotoChkp( ); break; }
+        case 6: { doListChkp( ); break; }
+        case 7: { doSetReadAhead( ); break; }
+        case 8: { doSetMaxWriteSize( ); break; }
+        case 9: { doSetSendDelay( false ); break; }
       }
 
     }
 
   }
+
+  // No matter how these end, if we left the mTCP stack running terminate it
+  // and reconnect the device driver to the packet driver if there are still
+  // connected drives.
+
+  localEndStack( );
+  connectNetDriveToPD( );
 
   return 0;
 }
@@ -493,8 +442,7 @@ int resolveServer( void ) {
       if ( checkUserExit( ) ) { return -1; }
       if ( !Dns::isQueryPending( ) ) break;
 
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
+      Utils::processPackets( );
       Dns::drivePendingQuery( );
     }
   }
@@ -505,8 +453,10 @@ int resolveServer( void ) {
     return -1;
   }
 
-  printf( "Server ip address is: %u.%u.%u.%u\n",
-          TargetServerAddr[0], TargetServerAddr[1], TargetServerAddr[2], TargetServerAddr[3] );
+  if ( Verbose ) {
+    printf( "\nServer IP address is: %u.%u.%u.%u\n",
+            TargetServerAddr[0], TargetServerAddr[1], TargetServerAddr[2], TargetServerAddr[3] );
+  }
 
   return 0;
 }
@@ -536,10 +486,17 @@ void udpHandler( const uint8_t *packet, const UdpHeader *udp ) {
     // Command starts right after the UDP header.
     Command_Packet_t *cmdResp = (Command_Packet_t *)(udp+1);
 
-
     if ( cmdResp->Version != SERVER_PROTOCOL_VERSION ) {
-      printf( "Error: Wrong server protocol version.  Expected %d, received %d\n",
-          SERVER_PROTOCOL_VERSION, cmdResp->Version);
+
+      if ( OutgoingCmdPkt.cmdPkt.Operation == Op_Connect ) {
+        strcpy( (char *)ReceivedCmdPkt_OptPayload, "The server doesn't understand this version of the client." );
+        ReceivedCmdPkt.Result = 1;
+        RespReceived = true;
+      } else {
+        printf( "Error: Wrong server protocol version.  Expected %d, received %d\n",
+            SERVER_PROTOCOL_VERSION, cmdResp->Version);
+      }
+
     } else {
 
       // Validate the incoming operation and sequence number.
@@ -626,13 +583,16 @@ int sendMsgAndWait( Operation_t op, int16_t payloadLen, char *msgName, int opTim
   // gone through ARP resolution and we are not using features that would
   // cause a hard failure from sendUdp.
 
-  int rc = Udp::sendUdp( TargetServerAddr, OurPort, TargetServerPort, outgoingLen, (uint8_t *)&OutgoingCmdPkt, 1 );
 
   clockTicks_t startTime = TIMER_GET_CURRENT( );
 
-  while ( rc != 0 ) {
+  while ( true ) {
 
-    if ( rc == -1 ) {
+    int rc = Udp::sendUdp( TargetServerAddr, OurPort, TargetServerPort, outgoingLen, (uint8_t *)&OutgoingCmdPkt, 1 );
+
+    if ( rc == 0 ) {
+      break;
+    } else if ( rc == -1 ) {
       printf( "Error: Failed to send %s message.\n", msgName );
       return 1;
     }
@@ -642,11 +602,7 @@ int sendMsgAndWait( Operation_t op, int16_t payloadLen, char *msgName, int opTim
       return 1;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-
-    rc = Udp::sendUdp( TargetServerAddr, OurPort, TargetServerPort, outgoingLen, (uint8_t *)&OutgoingCmdPkt, 1 );
-
+    Utils::processPackets( );
   }
 
 
@@ -657,7 +613,7 @@ int sendMsgAndWait( Operation_t op, int16_t payloadLen, char *msgName, int opTim
       printf( "Error: Timeout waiting for %s message response.\n", msgName );
       return 2;
     }
-    PACKET_PROCESS_SINGLE;
+    Utils::processPackets( );
   }
 
   return 0;
@@ -665,6 +621,7 @@ int sendMsgAndWait( Operation_t op, int16_t payloadLen, char *msgName, int opTim
 
 
 
+static char firstDrive[] = "A:";
 
 void doStatus( void ) {
 
@@ -678,9 +635,8 @@ void doStatus( void ) {
   // the pointer to the per-unit data obtained from the IOCTL call.
   // Clever, eh?
 
-  char firstDrive[] = "A:";
   firstDrive[0] = net_data->firstDriveLetter;
-  if ( net_data->firstDriveLetter == 0 ) {
+  if ( firstDrive[0] == 0 ) {
     // Figure out the starting drive letter
     int precedingUnits = curr_unit - unitStart;
     firstDrive[0] = (TargetDriveLetter - precedingUnits) - 1 + 'A';
@@ -689,7 +645,7 @@ void doStatus( void ) {
   printf( "NetDrive units: %u, First drive letter: %s\n\n", *units_p, firstDrive );
 
   if (net_data->pkt_drv_int == 0) {
-    puts( NoConnectedDrives );
+    puts( "No connected drives." );
     return;
   }
 
@@ -698,9 +654,7 @@ void doStatus( void ) {
           net_data->my_mac[0], net_data->my_mac[1], net_data->my_mac[2],
           net_data->my_mac[3], net_data->my_mac[4], net_data->my_mac[5] );
 
-  // printf( "Packet Int: 0x%02X, Sent Arp Replies: %lu\n", net_data->pkt_drv_int, net_data->count_arp_resp );
-
-  printf( "Packet driver int: 0x%X, Netdrive shim int: ", net_data->pkt_drv_int );
+  printf( "Packet driver int: 0x%X, Netdrive pass-through int: ", net_data->pkt_drv_int );
 
   if ( net_data->pkt_drv_int2 ) {
     printf("0x%X\n", net_data->pkt_drv_int2 );
@@ -743,13 +697,22 @@ void doStatus( void ) {
 // Just a wrapper around the mTCP library initStack call that spits out an
 // error message for us.
 
+static bool endStackRequired = false;
+
 int localInitStack( void ) {
   // No sockets, no buffers TCP buffers
   int rc = Utils::initStack( 0, 0, ctrlBreakHandler, ctrlBreakHandler );
   if ( rc ) {
     puts( "Failed to initialize the network." );
+  } else {
+    endStackRequired = true;
   }
   return rc;
+}
+
+void localEndStack( void ) {
+  if ( endStackRequired ) Utils::endStack( );
+  endStackRequired = false;
 }
 
 
@@ -760,22 +723,90 @@ int localInitStack( void ) {
 //
 // In the simple case there is just one software interrupt for a packet
 // driver specified in the config file.  If there is a second then we
-// actively manage it, installing and removing our shim packet driver
+// actively manage it, installing and removing our pass-through packet driver
 // when we connect or disconnect.
 //
 // At the end of execution, if there are any connected netdrives we
 // need to ensure we are connected again.  Likewise, if there are no
-// connected hard drives then basically "unload" our shim packet driver
+// connected hard drives then basically "unload" our pass-through packet driver
 // so everything operates normally against the real packet driver.
+
+
+
+// connectNetDriveToPD
+//
+// Connect the device driver to the packet driver if needed.  Also install
+// the pass-through driver if needed.  This should always be safe to call.
+
+void connectNetDriveToPD( void ) {
+
+  // If there is nothing to connect or we are already connected, do nothing.
+  if ( (net_data->connectedCount == 0) || (net_data->pkt_drv_int != 0) ) {
+    return;
+  }
+
+  uint8_t primaryInt = Utils::getPacketInt();
+
+  int rc = Packet_init2( primaryInt, net_data->segment, net_data->receiverFuncOffset );
+
+  // This should never happen because we already know the packet driver is good.  
+  if ( rc == -1 ) {
+    puts( "Error: Failed to connect to the packet driver.  Please report this bug." );
+    exit(1);
+  }
+
+  net_data->pkt_drv_handle = Packet_getHandle( );
+  net_data->pkt_drv_int = primaryInt;
+
+  // Modify the device driver code to call the packet driver where it lives.
+  // Doing this is better than dealing with a large jump table of interrupt instructions.
+  uint8_t far * intNumber = (uint8_t far *)MK_FP(net_data->segment, net_data->intInstOffset);
+  *(intNumber+1) = primaryInt;
+
+
+  // Hide the packet driver by altering its signature so that nothing else
+  // tries to use it.  (NetDrive has asked for all packet types, so they
+  // should not be able to use it.)
+  uint8_t far * far * primaryIntCode = (uint8_t far * far *)MK_FP( 0x0, primaryInt * 4 );
+  (*(primaryIntCode))[3] = '_';
+
+
+  // Hook the secondary packet interrupt if it was specified.  If it fails
+  // show a message, but it is not fatal.
+
+  uint8_t secondaryInt = Utils::getPacketInt2();
+
+  if ( secondaryInt ) {
+
+    uint16_t far * intCode = (uint16_t far *)MK_FP( 0x0, secondaryInt * 4 );
+
+    bool vacant = ((*intCode == 0x0000) && (*(intCode+1) == 0x0000)) ||
+                  ((*intCode == 0xF815) && (*(intCode+1) == 0xF000));
+
+    if ( !vacant ) {
+      printf( "Error: Pass-through packet driver not installed because 0x%X is in use.", secondaryInt );
+    } else {
+      uint16_t far *intVector = (uint16_t far *)MK_FP( 0x0, secondaryInt * 4 );
+      *intVector = net_data->shimOffset;
+      *(intVector+1) = net_data->segment;
+      net_data->pkt_drv_int2 = secondaryInt;
+      SecondaryPDMsg = 1;
+    }
+  }
+
+  // Enable the device driver to receive messages.
+  net_data->pkt_recv_on = 1;
+}
 
 
 // disconnectNetDriveFromPD
 //
-// Disconnect disables the secondary software interrupt, so any messages sent
-// from this program will use the primary software interrupt (the real
-// packet driver).
+// Disconnect the device driver from the primary packet driver.  This should
+// always be safe to call.
 
 void disconnectNetDriveFromPD( void ) {
+
+  if ( net_data->pkt_drv_int == 0 ) return;
 
   // First tell the driver to stop processing incoming packets.
   net_data->pkt_recv_on = 0;
@@ -788,6 +819,11 @@ void disconnectNetDriveFromPD( void ) {
   // Wipe out pkt_drv_handle and pkt_drv_int to make it clear we are not connected.
   net_data->pkt_drv_handle = 0;
   net_data->pkt_drv_int = 0;
+
+  // Restore the signature of the primary packet driver.
+  uint8_t primaryInt = Utils::getPacketInt();
+  uint8_t far * far * intCode = (uint8_t far * far *)MK_FP( 0x0, primaryInt * 4 );
+  (*(intCode))[3] = 'P';
 
   // Unhook the secondary packet interrupt if it was specified.  We're just
   // going to use zeros, which works even on a PCjr.  Only unhook it if we
@@ -803,54 +839,7 @@ void disconnectNetDriveFromPD( void ) {
 }
 
 
-void connectNetDriveToPD( void ) {
-
-  int rc = Packet_init2( Utils::getPacketInt( ), net_data->segment, net_data->receiverFuncOffset );
-
-  // This should never happen.
-  if ( rc == -1 ) {
-    puts( "Error: Failed to connect to the packet driver." );
-    exit(1);
-  }
-
-  net_data->pkt_drv_handle = Packet_getHandle( );
-  net_data->pkt_drv_int = Utils::getPacketInt( );
-
-  // Forgive me ... yes, we are modifying the actual code to put
-  // the interrupt number in it.
-  uint8_t far * intNumber = (uint8_t far *)MK_FP(net_data->segment, net_data->intInstOffset);
-  *(intNumber+1) = Utils::getPacketInt( );
-
-
-  // Hook the secondary packet interrupt if it was specified.
-
-  SecondaryPDMsg = 0;
-
-  uint8_t secondaryInt = Utils::getPacketInt2();
-
-  if ( secondaryInt ) {
-
-    uint16_t far * intCode = (uint16_t far *)MK_FP( 0x0, secondaryInt * 4 );
-
-    bool vacant = ((*intCode == 0x0000) && (*(intCode+1) == 0x0000)) ||
-                  ((*intCode == 0xF815) && (*(intCode+1) == 0xF000));
-
-    if ( vacant ) {
-      uint16_t far *intVector = (uint16_t far *)MK_FP( 0x0, secondaryInt * 4 );
-      *intVector = net_data->shimOffset;
-      *(intVector+1) = net_data->segment;
-      net_data->pkt_drv_int2 = secondaryInt;
-      SecondaryPDMsg = 1;
-    }
-
-    // If it's not vacant we would not have gotten here ..  Utils::initStack
-    // would have tripped on it first.
-
-  }
-
-}
-
-
+static char fn[] = "A:\\README.TXT";
 
 void fakeStat( void ) {
 
@@ -862,7 +851,6 @@ void fakeStat( void ) {
   // that the media changed.
 
   struct stat statbuf;
-  char fn[] = "A:\\README.TXT";
   fn[0] = TargetDriveLetter+64;
   stat(fn, &statbuf);
 }
@@ -874,127 +862,88 @@ void fakeStat( void ) {
 // Send a connect message to the server to see if it has the virtual
 // hard drive that we want.  If it does, setup the device driver to
 // take over packet handling.
-//
-// doConnect is actually a wrapper for doConnect_internal, which does the
-// hard work.  There are a lot of ways for doConnect_internal to fail so
-// it makes error handling easier to use a wrapper.
 
-int doConnect( void ) {
+void doConnect( void ) {
 
   if ( curr_unit->session != 0 ) {
     puts( "Error: A remote disk image is already connected." );
-    return 1;
+    return;
   }
 
-  int rc = doConnect_internal( );
-
-  if ( rc != 0 ) {
-
-    // Something went wrong.  If there are other connected drive letters then we need
-    // to reconnect the packet driver or they are dead.
-    //
-    // If you get here and other drive letters are connected, then we disconnected.
-    // Restore the connection to the device driver for those other drives.
-    if ( net_data->connectedCount ) {
-      connectNetDriveToPD( );
-      net_data->pkt_recv_on = 1;
-    }
-  }
-
-  return rc;
-
-}
-
-
-int doConnect_internal( void ) {
-
-  // If no drives are connected yet then we are going to fully initialize the
-  // net_data structure, except for the first eight bytes that are read-only for us.
-  //
-  // The driver starts with all of these as clean, so this only has an impact after
-  // we start, connect, and then disconnect.  (While drives are connected we need
-  // to preserve everything.)
+  // If no drives are connected we zero out the net_data structure, except for
+  // the first few bytes that are owned by the device driver and the statically
+  // initialized ARP response.  Otherwise, the data structure has things that
+  // need to be preserved.
 
   if ( net_data->connectedCount == 0 ) {
-    for (int i=12; i < sizeof(Net_data_t); i++) { ((uint8_t far *)net_data)[i] = 0; }
+    //for (int i=12; i < sizeof(Net_data_t); i++) { ((uint8_t far *)net_data)[i] = 0; }
+    for ( int i = offsetof(Net_data_t, pkt_drv_handle); i < offsetof(Net_data_t, arpRespEyeCatcher); i++ ) {
+      ((uint8_t far *)net_data)[i] = 0;
+    }
   }
 
   // Always clear out the unit specific data that we are going to touch.
   for (int i=0; i < sizeof(Unit_t); i++) { ((uint8_t far *)curr_unit)[i] = 0; }
 
 
-  // If there are drives already connected then the device driver owns the packet
-  // driver.  We have to temporarily steal it so we can use it.
+  // If there are connected drives then the device driver is connected to the
+  // packet driver.  We have to temporarily disconnect them it so we can use it.
+  // (Consider making the pass-through packet driver required so that we don't
+  // have to do this.)
 
-  if ( net_data->connectedCount > 0 ) {
-    disconnectNetDriveFromPD( );
-  }
+  disconnectNetDriveFromPD( );
 
   // Setup the normal mTCP stack so we can send and receive UDP messages.
-  if ( localInitStack( ) ) {
-    return 1;
-  }
+  if ( localInitStack( ) ) return;
 
   // From this point forward you have to call Utils::endStack( ) routine to
   // exit because we have the timer interrupt and Ctrl-Break interrupt hooked.
-
-  EthAddr_t local_my_mac;
-  Packet_get_addr( local_my_mac );
-
-  if ( resolveServer( ) != 0 ) {
-    Utils::endStack( );
-    return 1;
-  }
+  // The function that called here will do that if we don't explicitly do it.
 
 
-  // Figure out the next hop address for the specified server.
-  //
-  // We cheat by determining the next hop address (going to the server
-  // directly on the same network or going through the gateway) to
-  // keep the device driver simple.
+  // Resolve the server and get the next hop address for it.  The next hop
+  // address gets cached in the unit data so that we don't have to worry about
+  // resolving it in the driver.  This breaks if the path to the server
+  // changes, but people generally don't alter their network topology while
+  // things are running.
   //
   // This works by asking the IP code to fill in the destination Ethernet
   // address (the next hop) for a fake IP packet.  Only the destination field
   // needs to be set.  ARP resolution will happen and the next hop Ethernet
   // address will be given to us.
 
+  if ( resolveServer( ) != 0 ) return;
+
   IpHeader i;
   Ip::copy( i.ip_dest, TargetServerAddr );
 
   clockTicks_t startTime = TIMER_GET_CURRENT( );
 
-  bool nextHopIsSet = false;
-  while ( !nextHopIsSet ) {
+  while ( true ) {
 
-    if ( checkUserExit( ) ) {
-      Utils::endStack( );
-      return 1;
+    if ( checkUserExit( ) ) return;
+
+    if ( Timer_diff( startTime, TIMER_GET_CURRENT( ) ) > TIMER_SECS_TO_TICKS( 5 ) ) {
+      printf( "Error: ARP resolution for %u.%u.%u.%u failed.\n",
+              TargetServerAddr[0], TargetServerAddr[1], TargetServerAddr[2], TargetServerAddr[3] );
+      return;
     }
-
-    if ( Timer_diff( startTime, TIMER_GET_CURRENT( ) ) > TIMER_SECS_TO_TICKS( 2 ) ) break;
 
     EthAddr_t local_next_hop_mac;
     int rc = i.setDestEth( local_next_hop_mac );
     if ( rc == 0 ) {
       copyEth(curr_unit->next_hop_mac, local_next_hop_mac);
-      nextHopIsSet = true;
       break;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
+    Utils::processPackets( );
   }
 
-  if ( !nextHopIsSet ) {
-    printf( "Error: ARP resolution for %u.%u.%u.%u failed.\n",
-            TargetServerAddr[0], TargetServerAddr[1], TargetServerAddr[2], TargetServerAddr[3] );
-    Utils::endStack( );
-    return 1;
+  if ( Verbose ) {
+    printf( "Next hop address: %02X:%02X:%02X:%02X:%02X:%02X\n",
+            curr_unit->next_hop_mac[0], curr_unit->next_hop_mac[1], curr_unit->next_hop_mac[2],
+            curr_unit->next_hop_mac[3], curr_unit->next_hop_mac[4], curr_unit->next_hop_mac[5] );
   }
-
-  printf( "Next hop address: %02X:%02X:%02X:%02X:%02X:%02X\n",
-          curr_unit->next_hop_mac[0], curr_unit->next_hop_mac[1], curr_unit->next_hop_mac[2],
-          curr_unit->next_hop_mac[3], curr_unit->next_hop_mac[4], curr_unit->next_hop_mac[5] );
 
 
 
@@ -1005,6 +954,9 @@ int doConnect_internal( void ) {
 
   Sequence = rand( );
   Session = 0;
+
+  EthAddr_t local_my_mac;
+  Packet_get_addr( local_my_mac );
 
   // Setup the parts of the packet unique to this command
   ConnectPayload_t *p = (ConnectPayload_t *)&(OutgoingCmdPkt.payload);
@@ -1018,56 +970,25 @@ int doConnect_internal( void ) {
   // We include the terminating nul on the drive image name just to be consistent.
   int payloadLen = sizeof(EthAddr_t) + 2 + 2 + OS_STRING_MAXLEN + strlen(TargetDriveName) + 1;
 
-  if ( sendMsgAndWait( Op_Connect, payloadLen, "Connect", 2 ) ) {
-    Utils::endStack( );
-    return 1;
+  if ( sendMsgAndWait( Op_Connect, payloadLen, "Connect", 5 ) ) {
+    return;
   }
+
+  // We are done talking to the server in this program.  Now we need to
+  // disconnect from the packet driver and hand it over to the device driver.
+  localEndStack( );
 
   if ( ReceivedCmdPkt.Result != 0 ) {
     printf( "Error opening virtual hard drive: %s,\n  %s\n", TargetDriveName, ReceivedCmdPkt_OptPayload );
-    Utils::endStack( );
-    return 1;
+    return;
   }
-
 
   // Always keep the drive driver Session and Sequence variables in sync.
   // (These will be copied to the unit data before they change.)
   Session = ReceivedCmdPkt.Session;
   Sequence++;
 
-  printf( "Session (%u) started, virtual hard drive opened: %s\n", Session, TargetDriveName );
-
-
-  // This horrible hack lets us do all of the endstack steps but leaves tracing on.
-  // That includes ending incoming packet receiving, disconnecting the packet driver,
-  // stopping IP reassembly, unhooking the timer, and restoring the old CtrlBreak handler.
-
-  Utils::endStack2( true );
-
-
-  // Now comes the part where we hook the device driver and the packet driver together.
-
-  // Connect to the packet driver.  This will also tell it to start calling
-  // the receiver funciton in the device driver, but that will default to
-  // just throwing everything away until we tell it to do otherwise.
-  //
-  // This really should never fail - we just used the packet driver up above.
-
-  connectNetDriveToPD( );
-
-  printf( "Packet driver connected at interrupt: 0x%X\n", Utils::getPacketInt( ) );
-
-  if ( SecondaryPDMsg == 0 ) {
-    puts("NetDrive packet driver shim not enabled; do not use other mTCP programs." );
-  } else if ( SecondaryPDMsg == 1 ) {
-    printf("NetDrive packet driver shim connected at: 0x%X\n", Utils::getPacketInt2() );
-  }
-
-  // There could be a 3rd message here about the specified NetDrive shim already
-  // being in use by something else, and therefore unavailable.  But you can never
-  // actually get that far because when this program initially tries to talk to the
-  // server it won't be able to because Utils::initStack will trip on the secondary
-  // software interrupt first and not load.
+  printf( "\nSession (%u) started for image \"%s\"\n", Session, TargetDriveName );
 
 
   // Populate net_data structures that are shared by all units:
@@ -1077,25 +998,18 @@ int doConnect_internal( void ) {
     net_data->timeoutThreshold = TimeoutTicks;
     net_data->retries = TimeoutRetries;
 
+    net_data->my_mtu = MyMTU;
     copyIp( net_data->my_ip, MyIpAddr );
     net_data->my_port = OurPort;
     copyEth( net_data->my_mac, local_my_mac );
 
-    // Setup the prebuilt ARP packet.  Fix me, not needed if we did it already.
+    // Setup the prebuilt ARP packet.  Many of the fields are statically
+    // initialized in the device driver.
 
-    copyBytes( net_data->arpRespEyeCatcher, "ARPRESP ", sizeof(net_data->arpRespEyeCatcher) );
     copyEth( net_data->prebuiltArpResponse.src, net_data->my_mac );
-    net_data->prebuiltArpResponse.ethType = 0x0608;
-    net_data->prebuiltArpResponse.arpHeader.hardwareType = 0x0100;
-    net_data->prebuiltArpResponse.arpHeader.protocolType = 0x0008;
-    net_data->prebuiltArpResponse.arpHeader.hlen = 6;
-    net_data->prebuiltArpResponse.arpHeader.plen = 4;
-    net_data->prebuiltArpResponse.arpHeader.operation = 0x0200;
     copyEth( net_data->prebuiltArpResponse.arpHeader.sender_ha, net_data->my_mac );
     copyIp( net_data->prebuiltArpResponse.arpHeader.sender_ip, MyIpAddr );
-    copyBytes( net_data->prebuiltArpResponse.padding,
-               "mTCP by M Brutman ", 
-               sizeof(net_data->prebuiltArpResponse.padding ));
+
   }
 
 
@@ -1117,14 +1031,13 @@ int doConnect_internal( void ) {
 
   if (connectResp->bpb_u.bpb.bytesPerSector != 512) {
     if ( (connectResp->filesize == 160*1024ul) && (connectResp->mediaDesc == 0xfe)) {
-      puts( "Detected DOS 1.x 160KB floppy image without a BPB." );
+      printf( DOS_11_BPB_formatStr, 160 );
       memcpy(connectResp->bpb_u.bpbBytes, &DOS_1_160KB, sizeof(BPB_t));
     } else if ( (connectResp->filesize == 320*1024ul) && (connectResp->mediaDesc == 0xff)) {
-      puts( "Detected DOS 1.x 320KB floppy image without a BPB." );
+      printf( DOS_11_BPB_formatStr, 320 );
       memcpy(connectResp->bpb_u.bpbBytes, &DOS_1_320KB, sizeof(BPB_t));
     }
   }
-
 
   // Copy the BPB for this remote drive.
   for ( int i=0; i<sizeof(BPB_t); i++ ) {
@@ -1137,10 +1050,57 @@ int doConnect_internal( void ) {
     curr_unit->readonly = 1;
   }
 
-  net_data->connectedCount++;
+
+  // Set unit specific max readahead, readahead delay and max write size.
+
+  char *slip = getenv( "MTCPSLIP" );
+
+  // Set the readahead if it was requested.  (The default is 0 which is fine.)
+  if ( (readAheadParm == -1) && (slip == NULL) ) {
+
+    // readAheadParm not set; use a reasonable default
+
+    if ( DetectedCPU == 0 ) {
+      curr_unit->max_readahead = 4*2;   // 4KB (8 blocks) for slower machines
+    } else if ( DetectedCPU == 1 ) {
+      curr_unit->max_readahead = 4*2;   // 4KB (8 blocks) for faster machines
+    } else if ( DetectedCPU == 2 ) {
+      curr_unit->max_readahead = 8*2;   // 8KB (16 blocks) for even faster machines
+    } else {
+      curr_unit->max_readahead = 16*2;  // 16KB (32 blocks) for the fastest machines
+    }
+
+  } else {
+    curr_unit->max_readahead = readAheadParm*2;
+  }
+
+  curr_unit->readahead_delay = 0;
+
+  // The user specifies this in KB, we use blocks in the device driver.
+  if ( maxWriteParm == -1 ) {
+    curr_unit->max_write_size = 32 * 2;
+  } else {
+    curr_unit->max_write_size = maxWriteParm * 2;
+  }
+
+
+  if ( Timer_modeDetector( ) == 2 ) {
+    net_data->one_10th_ms = TIMER_8253_ONE_MS / 10;
+  } else {
+    net_data->one_10th_ms = TIMER_8253_ONE_MS / 5;
+  }
+
+  // If the user doesn't set a send delay, then we do it automatically.
+  // If they set a delay, we keep that and never touch it.
+  // If it is automatic and it's a fast CPU, set it to 0.5 milliseconds 
+ 
+  doSetSendDelay( true );
+
+
 
   // Now we are fully initialized.  Enable the driver to process received packets.
-  net_data->pkt_recv_on = 1;
+  net_data->connectedCount++;
+  connectNetDriveToPD( );
 
 
   // Set the media changed flag and do a fake operation against the FAT to get
@@ -1150,9 +1110,8 @@ int doConnect_internal( void ) {
 
   // Messages come last ...
 
-  printf( "\nDrive size: %lu, Media descriptor byte from FAT: %02X\n",
+  printf( "Drive size: %lu, Media descriptor byte from FAT: %02X\n",
           connectResp->filesize, connectResp->mediaDesc );
-
 
   if ( ReadOnly == true ) {
     puts( "Readonly option found, writes will be blocked by the device driver." );
@@ -1175,7 +1134,27 @@ int doConnect_internal( void ) {
 
   }
 
-  return 0;
+  printf( "\nNetDrive uses the packet driver at 0x%X, ", Utils::getPacketInt( ) );
+  if ( SecondaryPDMsg == 0 ) {
+    puts("pass-through packet driver not enabled." );
+  } else if ( SecondaryPDMsg == 1 ) {
+    printf("pass-through driver available at 0x%X\n", Utils::getPacketInt2() );
+  }
+
+  if ( ( readAheadParm == -1 ) || ( maxWriteParm == -1 ) ) {
+    puts("");
+  }
+
+  printf("Max read-ahead: %uKB, Max write size: %uKB, Send Delay: %u.%ums%\n",
+         curr_unit->max_readahead/2, curr_unit->max_write_size/2,
+         net_data->pkt_send_delay/10, net_data->pkt_send_delay%10);
+
+  if ( ( readAheadParm == -1 ) || ( maxWriteParm == -1 ) ) {
+    puts("One of those values was auto selected or is a default.  Use the -mra, -mws\n"
+         "and -sd options to set better values for this connected image.");
+  }
+
+  return;
 }
 
 
@@ -1210,7 +1189,7 @@ void doDisconnect( void ) {
   curr_unit->session = 0;
   net_data->connectedCount--;
   fakeStat( );
-  puts( "Drive disconnected from network." );
+  puts( "Drive letter disconnected." );
 
 
   // Setup the normal mTCP stack so we can send and receive UDP messages.
@@ -1218,44 +1197,30 @@ void doDisconnect( void ) {
   // other drive letters that are connected.  So if we fail here, reconnect
   // those if needed.
 
-  if ( localInitStack( ) ) {
-    if ( net_data->connectedCount ) {
-      connectNetDriveToPD( );
-      net_data->pkt_recv_on = 1;
-    }
-    return;
-  }
+  if ( localInitStack( ) ) return;
 
   // From this point forward you have to call the Utils:endStack( ) routine to
   // exit because we have the timer interrupt hooked.
 
   Udp::registerCallback( OurPort, udpHandler );
 
-  sendMsgAndWait( Op_Disconnect, 0, "disconnect", 2 );
+  sendMsgAndWait( Op_Disconnect, 0, "disconnect", 5 );
 
   if ( RespReceived == false ) {
-    puts( "(The network drive is disconnected but the server may not know it.)" );
+    puts( "(The drive letter is disconnected but the server may not know it.)" );
   } else {
     if ( ReceivedCmdPkt.Result == 0 ) {
       printf( "Server session (%u) ended\n", Session );
     } else {
       printf( "Server error trying to end session (%u): %s\n", Session, ReceivedCmdPkt_OptPayload );
-      puts( "(Either way, the network drive is disconnected.)" );
+      puts( "(Either way, the drive letter is disconnected.)" );
     }
   }
 
-  Utils::endStack( );
 
+  // localEndStack( );
+  // connectNetDriveToPD( );
 
-  // Reconnect the packet driver to the device driver if there are any connected
-  // drives remaining.
-
-  if ( net_data->connectedCount ) {
-    connectNetDriveToPD( );
-    net_data->pkt_recv_on = 1;
-  }
-
-  return;
 }
 
 
@@ -1273,11 +1238,7 @@ void doMarkChkp( void ) {
   // Setup the normal mTCP stack so we can send and receive UDP messages.
   // If this fails always reconnect to the device driver.
 
-  if ( localInitStack( ) ) {
-    connectNetDriveToPD( );
-    net_data->pkt_recv_on = 1;
-    return;
-  }
+  if ( localInitStack( ) ) return;
 
   // From this point forward you have to call Utils::endStack( ) routine to
   // exit because we have the timer interrupt and Ctrl-Break interrupt hooked.
@@ -1287,7 +1248,7 @@ void doMarkChkp( void ) {
   // Setup the parts of the packet unique to this command
   // Do not transmit the tag with the trailing nul char; it is not needed.
   strcpy((char *)(&OutgoingCmdPkt.payload), Tag);
-  sendMsgAndWait( Op_Mark_Chkp, strlen(Tag), "mark checkpoint", 2 );
+  sendMsgAndWait( Op_Mark_Chkp, strlen(Tag), "mark checkpoint", 5 );
 
 
   // If sendMsgAndWait fails or times out there isn't much to do.
@@ -1306,14 +1267,8 @@ void doMarkChkp( void ) {
     }
   }
 
-  Utils::endStack( );
-
-
-  // Reconnect the packet driver to the device driver if there are any connected
-  // drives remaining.
-
-  connectNetDriveToPD( );
-  net_data->pkt_recv_on = 1;
+  // localEndStack( );
+  // connectNetDriveToPD( );
 
 }
 
@@ -1355,10 +1310,10 @@ void doGotoChkp( void ) {
   // Setup the normal mTCP stack so we can send and receive UDP messages.
   // If this fails undo what we did and reconnect to the device driver.
 
+  // Special handling - just can't let main clean this up.
   if ( localInitStack( ) ) {
     curr_unit->session = Session;
     connectNetDriveToPD( );
-    net_data->pkt_recv_on = 1;
     fakeStat( );
     return;
   }
@@ -1431,8 +1386,7 @@ void doGotoChkp( void ) {
           "before trying it again." );
   }
 
-  Utils::endStack( );
-
+  localEndStack( );
 
   // Reconnect the packet driver to the device driver if there are any connected
   // drives remaining.
@@ -1440,7 +1394,6 @@ void doGotoChkp( void ) {
   // Restore the session number and force another media change.
   curr_unit->session = Session;
   connectNetDriveToPD( );
-  net_data->pkt_recv_on = 1;
   fakeStat( );
 }
 
@@ -1455,71 +1408,198 @@ void doListChkp( void ) {
   // Setup the normal mTCP stack so we can send and receive UDP messages.
   // If this fails always reconnect to the device driver.
 
-  if ( localInitStack( ) ) {
-    connectNetDriveToPD( );
-    net_data->pkt_recv_on = 1;
-    return;
-  }
+  if ( localInitStack( ) ) return;
 
   // From this point forward you have to call Utils::endStack( ) routine to
   // exit because we have the timer interrupt and Ctrl-Break interrupt hooked.
 
   Udp::registerCallback( OurPort, udpHandler );
 
-  sendMsgAndWait( Op_List_Chkp, strlen(Tag), "list checkpoint", 2 );
 
+  // The server might have a lot of data to return to us; more than fits in
+  // a single packet.  Assume the server will generate a list once when
+  // we make this call and cache it.  Tell the server how big our buffer is
+  // and what line number we want.  The server will send lines.  Keep calling
+  // until we get all of the data.
 
-  // If sendMsgAndWait fails or times out there isn't much to do.
-  // No matter what happens (timeout, fail or success) we are going
-  // to reconnect the packet driver.
+  typedef struct {
+    uint16_t startLine;
+    uint16_t bufferSize;
+  } list_cp_req_msg;
 
-  if ( RespReceived == true ) {
-    // If we get a response always advance the sequence number and keep it
-    // in sync with the device driver.
-    Sequence++;
-    curr_unit->sequence = Sequence;
-    if ( ReceivedCmdPkt.Result == 0 ) {
-      // The response message is not terminated, but our receive buffer
-      // was initialized with nulls so we'll be ok.
-      printf( "Checkpoints:\n%s\n", ReceivedCmdPkt_OptPayload );
+  list_cp_req_msg *req = (list_cp_req_msg *)(&OutgoingCmdPkt.payload);
+
+  typedef struct {
+    uint8_t moreData;
+    uint16_t linesSent;
+  } list_cp_resp_msg;
+
+  list_cp_resp_msg *resp = (list_cp_resp_msg *)(ReceivedCmdPkt_OptPayload);
+
+  uint16_t startLine = 0;
+
+  while (1) {
+
+    req->startLine = startLine;
+    req->bufferSize = MAX_PAYLOAD_LEN;
+    req->bufferSize = 200;
+
+    sendMsgAndWait( Op_List_Chkp, 4, "list checkpoint", 5 );
+
+    // If sendMsgAndWait fails we could retry, but it's not worth the hassle.
+    // Just tell the user to try again if they need to.
+
+    if ( RespReceived == true ) {
+      // If we get a response always advance the sequence number and keep it
+      // in sync with the device driver.
+      Sequence++;
+      curr_unit->sequence = Sequence;
+      if ( ReceivedCmdPkt.Result == 0 ) {
+        // The response message is not terminated, but our receive buffer
+        // was initialized with nulls so we'll be ok.
+        printf( "%s", ReceivedCmdPkt_OptPayload + sizeof(list_cp_resp_msg) );
+      } else {
+        printf( "Server error: %s\n", ReceivedCmdPkt_OptPayload );
+        break;
+      }
     } else {
-      printf( "Server error: %s\n", ReceivedCmdPkt_OptPayload );
+      puts( "Timeout waiting for the checkpoint list - please try again." );
+      break;
     }
-  }
 
-  Utils::endStack( );
+    if ( resp->moreData == 0 ) break;
+    if ( checkUserExit() ) break;
 
+    startLine += resp->linesSent;
 
-  // Reconnect the packet driver to the device driver if there are any connected
-  // drives remaining.
+  } // end while
 
-  connectNetDriveToPD( );
-  net_data->pkt_recv_on = 1;
+  // localEndStack( );
+  // connectNetDriveToPD( );
+}
+
+void doSetReadAhead( ) {
+  int currentReadAheadKB = curr_unit->max_readahead / 2;
+  printf("ReadAhead was %uKB, setting to %uKB\n", currentReadAheadKB, readAheadParm);
+  curr_unit->max_readahead = readAheadParm*2;
+}
+
+void doSetMaxWriteSize( ) {
+  int currentMaxWriteSizeKB = curr_unit->max_write_size / 2;
+  printf("Max write size was %uKB, setting to %uKB\n", currentMaxWriteSizeKB, maxWriteParm);
+  curr_unit->max_write_size = maxWriteParm*2;
 }
 
 
+void doSetSendDelay( bool silent ) {
+
+  if ( UserSendDelay == 0xffff ) {
+
+    if ( DetectedCPU < 3 ) {
+      // Automatic
+      net_data->user_send_delay = UserSendDelay;
+      net_data->pkt_send_delay = 0;
+      if ( silent == false ) printf("Send delay set to auto.\n");
+    } else {
+      // The user didn't force it but we are going to force it to something
+      // safe because they may not know to.
+      net_data->user_send_delay = 5;
+      net_data->pkt_send_delay = 5;
+      if ( silent == false ) printf("Send delay: fast CPU detected, send delay set to %u.%ums.\n",
+          net_data->pkt_send_delay/10, net_data->pkt_send_delay%10);
+    }
+
+  } else {
+    // The user forced it to a value.
+    net_data->user_send_delay = UserSendDelay;
+    net_data->pkt_send_delay = UserSendDelay;
+    if ( silent == false ) printf("Send delay forced to %u.%ums.\n",
+          net_data->pkt_send_delay/10, net_data->pkt_send_delay%10);
+  }
+
+
+}
+
 
 char *HelpText = 
-  "netdrive <command> <parameters>\n"
+  "netdrive [-v] <command> <parameters>\n"
   "\n"
   "Commands:\n"
-  "  connect <ipaddr:port> <network_drive_name> <drive:> [-ro]\n"
-  "  disconnect <drive:>\n"
-  "  status <drive:>\n"
+  "  connect <ipaddr:port> <image_name> <N:> [-ro] [more connect options]\n"
+  "  disconnect <N:>\n"
+  "  status <N:>\n"
   "\n"
-  "Checkpoint commands:\n"
-  "  list_cp <drive:>\n"
-  "  mark_cp <drive:> <tag>\n"
-  "  goto_cp <drive:> -tag <tag> or -num <cp_num> [-del_marker]\n"
+  "Checkpoint commands: (Available on journaled drive images)\n"
+  "  list_cp <N:>\n"
+  "  mark_cp <N:> <tag>\n"
+  "  goto_cp <N:> -tag <tag> or -num <cp_num> [-del_marker]\n"
   "\n"
-  "<drive> is NetDrive drive letter, such as C:, D: or E: .\n"
-  "The -ro option marks the drive as read-only.";
+  "<N:> is NetDrive drive letter, such as C:, D: or E: .\n"
+  "\n"
+  "Connect, Disconnect, and Status can be abbreviated as \"c\", \"d\", or \"s\".\n"
+  "Use the \"morehelp\" command for more connect options and advanced commands.\n";
+
+char *ExtendedHelp =
+
+"More connect options:\n"
+"\n"
+"  connect <ipaddr:port> <image_name> <N:> [-ro] [more connect options]\n"
+"\n"
+"  -mra <n>  Set read-ahead for the drive in KB (range 0 to 64)\n"
+"  -mws <n>  Set max write size for the drive in KB (range 1 to 32)\n"
+"  -sd <n>   Set back-to-back packet send delay. Use \"auto\" or milliseconds\n"
+"            in the range 0.0 to 15.9. (The fractional part is required.)\n"
+"\n"
+"These commands change connect options after a drive is already connected.\n"
+"\n"
+"  set_max_ra <N:> <n>       Set max read-ahead (similar to -mra above)\n"
+"  set_max_ws <N:> <n>       Set max write size (similar to -mws above) \n"
+"  set_send_delay <N:> <n>   Set send delay (similar to -sd above)\n";
+
+
 
 void usage( ) {
   puts( HelpText );
   exit( 1 );
 }
 
+
+
+void parseSendDelay( const char *s ) {
+  if ( stricmp( s, "auto" ) == 0 ) {
+    UserSendDelay = -1;
+  } else {
+
+    UserSendDelay = 0;
+
+    int decimalState = 0;
+
+    while ( *s ) {
+      if ( *s == '.' ) {
+        if (decimalState > 0 ) {
+          usage( );
+        }
+        decimalState = 1;
+      } else if ( (*s < '0') | (*s > '9') ) {
+        usage( );
+      } else {
+        if ( decimalState < 2 ) {
+          UserSendDelay = UserSendDelay * 10;
+          UserSendDelay = UserSendDelay + *s - '0';
+          if (decimalState == 1 ) {
+            decimalState = 2;
+          }
+        }
+      }
+
+      s++;
+    }
+
+    if (decimalState < 2) UserSendDelay = UserSendDelay * 10;
+
+    if ( UserSendDelay > 159 ) usage( );
+  }
+}
 
 
 void getDriveNumber( const char *s ) {
@@ -1537,69 +1617,104 @@ void getDriveNumber( const char *s ) {
 }
 
 
-
 const char *TagNameTooLong = "The tag name is too long.\n";
 
 void parseArgs( int argc, char *argv[] ) {
 
   if ( argc == 1 ) usage( );
 
-  if ( (stricmp(argv[1], "connect") == 0) || (stricmp(argv[1], "c") == 0) ) {
+  int argIndex = 1;
 
-    if ( argc < 5) usage( );
+  if ( stricmp(argv[argIndex], "-v") == 0 ) {
+    Verbose = 1;
+    argIndex++;
+  }
+
+  if ( (argc - argIndex) == 0 ) usage( );
+
+  if ( (stricmp(argv[argIndex], "connect") == 0) || (stricmp(argv[argIndex], "c") == 0) ) {
+
+    argIndex++;
+
+    if ( (argc - argIndex) < 3 ) usage( );
 
     int j=0;
     bool colonFound = false;
-    while ( argv[2][j] != 0 ) {
-      if ( argv[2][j] != ':' ) {
-        if ( j < (SERVER_NAME_MAXLEN-1) ) TargetServerAddrName[j] = argv[2][j];
+    while ( argv[argIndex][j] != 0 ) {
+      if ( argv[argIndex][j] != ':' ) {
+        if ( j < (SERVER_NAME_MAXLEN-1) ) TargetServerAddrName[j] = argv[argIndex][j];
       } else {
         TargetServerAddrName[j] = 0;
         colonFound = true;
         j++;
-        TargetServerPort = atoi(argv[2]+j);
+        TargetServerPort = atoi(argv[argIndex]+j);
       }
       j++;
     }
     if ( colonFound == false ) usage( );
 
-    if ( strlen(argv[3]) < DRIVE_NAME_MAXLEN ) {
-      strcpy( TargetDriveName, argv[3]);
+    argIndex++;
+
+    if ( strlen(argv[argIndex]) < DRIVE_NAME_MAXLEN ) {
+      strcpy( TargetDriveName, argv[argIndex]);
     } else {
       puts( "The remote drive name is too long.\n" );
       usage( );
     }
 
-    getDriveNumber( argv[4] );
+    argIndex++;
+
+    getDriveNumber( argv[argIndex] );
+
+    argIndex++;
 
     Operation = 1;
 
-    if ( argc == 6 ) {
-      if ( stricmp( argv[5], "-ro" ) == 0 ) {
+    // End of positional parameters
+
+    while ( argIndex < argc ) {
+
+      if ( stricmp( argv[argIndex], "-ro" ) == 0 ) {
         ReadOnly = true;
-      }
-      else usage( );
+      } else if ( stricmp( argv[argIndex], "-mra" ) == 0 ) {
+        if ( ++argIndex == argc ) usage( );
+        readAheadParm = atoi(argv[argIndex]);
+        if ( readAheadParm < 0 || readAheadParm > 64 ) usage( );
+      } else if ( stricmp( argv[argIndex], "-mws" ) == 0 ) {
+        if ( ++argIndex == argc ) usage( );
+        maxWriteParm = atoi(argv[argIndex]);
+        if ( maxWriteParm < 1 || maxWriteParm > 32 ) usage( );
+      } else if ( stricmp( argv[argIndex], "-sd" ) == 0 ) {
+        if ( ++argIndex == argc ) usage( );
+        parseSendDelay( argv[argIndex] );
+      } else usage( );
+
+      argIndex++;
     }
 
   }
 
-  else if ( (stricmp(argv[1], "disconnect") == 0) || (stricmp(argv[1], "d") == 0) ) {
-    if ( argc < 3 ) usage( );
-    getDriveNumber( argv[2] );
+  else if ( (stricmp(argv[argIndex], "disconnect") == 0) || (stricmp(argv[argIndex], "d") == 0) ) {
+    argIndex++;
+    if ( (argc - argIndex) < 1 ) usage( );
+    getDriveNumber( argv[argIndex] );
     Operation = 2;
   }
 
-  else if ( (stricmp(argv[1], "status") == 0) || (stricmp(argv[1], "s") == 0) ) {
-    if ( argc < 3 ) usage( );
-    getDriveNumber( argv[2] );
+  else if ( (stricmp(argv[argIndex], "status") == 0) || (stricmp(argv[argIndex], "s") == 0) ) {
+    argIndex++;
+    if ( argIndex == argc ) usage( );
+    getDriveNumber( argv[argIndex] );
     Operation = 3;
   }
 
-  else if ( stricmp( argv[1], "mark_cp" ) == 0 ) {
-    if ( argc < 4 ) usage( );
-    getDriveNumber( argv[2] );
-    if ( strlen(argv[3]) < TAG_MAXLEN ) {
-      strcpy(Tag, argv[3]);
+  else if ( stricmp( argv[argIndex], "mark_cp" ) == 0 ) {
+    argIndex++;
+    if ( (argc - argIndex) < 2 ) usage( );
+    getDriveNumber( argv[argIndex] );
+    argIndex++;
+    if ( strlen(argv[argIndex]) < TAG_MAXLEN ) {
+      strcpy(Tag, argv[argIndex]);
     } else {
       puts( TagNameTooLong );
       usage( );
@@ -1607,20 +1722,26 @@ void parseArgs( int argc, char *argv[] ) {
     Operation = 4;
   }
 
-  else if ( stricmp( argv[1], "goto_cp" ) == 0 ) {
-    if ( argc < 5 ) usage( );
-    getDriveNumber( argv[2] );
+  else if ( stricmp( argv[argIndex], "goto_cp" ) == 0 ) {
+    argIndex++;
+    if ( (argc - argIndex) < 3 ) usage( );
+    getDriveNumber( argv[argIndex] );
+    argIndex++;
 
-    if ( stricmp(argv[3], "-tag") == 0 ) {
-      if ( strlen(argv[4]) < TAG_MAXLEN ) {
-        strcpy(Tag, argv[4]);
+    if ( stricmp(argv[argIndex], "-tag") == 0 ) {
+      argIndex++;
+      if ( strlen(argv[argIndex]) < TAG_MAXLEN ) {
+        strcpy(Tag, argv[argIndex]);
+        argIndex++;
       } else {
         puts( TagNameTooLong );
         usage( );
       }
-    } else if ( stricmp(argv[3], "-num") == 0 ) {
-      TagNum = atoi( argv[4] );
-      if ( TagNum == 0 ) {
+    } else if ( stricmp(argv[argIndex], "-num") == 0 ) {
+      argIndex++;
+      TagNum = atoi( argv[argIndex] );
+      argIndex++;
+      if ( TagNum < 0 ) {
         puts( "Bad checkpoint number\n" );
         usage( );
       }
@@ -1628,8 +1749,8 @@ void parseArgs( int argc, char *argv[] ) {
       usage( );
     }
 
-    if ( argc == 6 ) {
-      if ( stricmp(argv[5], "-del_marker") == 0 ) {
+    if ( (argc - argIndex) > 0 ) {
+      if ( stricmp(argv[argIndex], "-del_marker") == 0 ) {
         TagDelMarker = true;
       } else {
         usage( );
@@ -1639,10 +1760,45 @@ void parseArgs( int argc, char *argv[] ) {
     Operation = 5;
   }
 
-  else if ( stricmp( argv[1], "list_cp" ) == 0 ) {
-    if ( argc < 3 ) usage( );
-    getDriveNumber( argv[2] );
+  else if ( stricmp( argv[argIndex], "list_cp" ) == 0 ) {
+    argIndex++;
+    if ( (argc - argIndex) < 1 ) usage( );
+    getDriveNumber( argv[argIndex] );
     Operation = 6;
+  }
+
+  else if ( stricmp( argv[argIndex], "set_max_ra" ) == 0 ) {
+    argIndex++;
+    if ( (argc - argIndex) < 2 ) usage( );
+    getDriveNumber( argv[argIndex] );
+    argIndex++;
+    Operation = 7;
+    readAheadParm = atoi(argv[argIndex]);
+    if ( readAheadParm < 0 || readAheadParm > 64 ) usage( );
+  }
+
+  else if ( stricmp( argv[argIndex], "set_max_ws" ) == 0 ) {
+    argIndex++;
+    if ( (argc - argIndex) < 2 ) usage( );
+    getDriveNumber( argv[argIndex] );
+    argIndex++;
+    Operation = 8;
+    maxWriteParm = atoi(argv[argIndex]);
+    if ( maxWriteParm < 1 || maxWriteParm > 32 ) usage( );
+  }
+
+  else if ( stricmp( argv[argIndex], "set_send_delay" ) == 0 ) {
+    argIndex++;
+    if ( (argc - argIndex) < 2 ) usage( );
+    getDriveNumber( argv[argIndex] );
+    argIndex++;
+    Operation = 9;
+    parseSendDelay( argv[argIndex] );
+  }
+
+  else if ( stricmp( argv[argIndex], "morehelp" ) == 0 ) {
+    puts( ExtendedHelp );
+    exit( 0 );
   }
 
   else {

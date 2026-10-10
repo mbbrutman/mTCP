@@ -1,7 +1,7 @@
 /*
 
    mTCP Tcp.H
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -192,10 +192,13 @@ typedef struct {
 
 class TcpBuffer {
 
-  public:
-
     // The user only needs to fill in dataLen.  Everything else is managed
     // by the code.
+
+  friend class Tcp;
+  friend class TcpSocket;
+
+  private:
 
     uint32_t     seqNum;      // SeqNum+Len-1, determines when to free pkt
     uint16_t     dataLen;     // User data length: Filled in by user
@@ -219,7 +222,7 @@ class TcpBuffer {
     inline void setWasAckOnly( void )     { flags = flags | 0x01; }
 
 
-    // These two flags are only set inside sendPureAck.  ForceAckOnly will
+    // These two flags are only set inside sendImmediateAck.  ForceAckOnly will
     // ensure that no other flag bits get set on the packet.  This is used
     // when we get a packet with a bad sequence or acknowledgement number.
     // ForceProbe will cause us to set a slightly invalid sequence number
@@ -236,32 +239,22 @@ class TcpBuffer {
 
     // Buffer pool management
 
+  public:
+
     static int8_t init( uint8_t xmitBufs_p );
     static void   stop( void );
 
+    static TcpBuffer *getXmitBuf( void );               // Get a transmit buffer
+    static void       returnXmitBuf( TcpBuffer *tmp );  // Return a transmit buffer
+
+    inline uint16_t   getDataLen( void ) { return dataLen; }
+    inline void       setDataLen( uint16_t l ) { dataLen = l; }
+    
+  private:
+
     static TcpBuffer *xmitBuffers[TCP_MAX_XMIT_BUFS];
-    static uint8_t    freeXmitBuffers;       // Number of buffers in the list
-    static uint8_t    allocatedXmitBuffers;  // Total number of buffers allocated
-    static void      *xmitBuffersMemPtr;     // Use this to deallocate the memory
-
-
-    static inline TcpBuffer *getXmitBuf( void ) {
-      if (freeXmitBuffers) {
-        freeXmitBuffers--;
-        return xmitBuffers[freeXmitBuffers];
-      }
-      else { return NULL; };
-    }
-
-
-    static inline void returnXmitBuf( TcpBuffer *tmp ) {
-      // Defend against returning a buffer that doesn't belong to the pool.
-      if ( tmp->bufferPool ) {
-        xmitBuffers[freeXmitBuffers] = tmp;
-        freeXmitBuffers++;
-      }
-    }
-
+    static void      *xmitBuffersMemPtr;                // Use this to deallocate the memory
+    static uint8_t    freeXmitBuffers;                  // Number of buffers in the list
 };
 
 
@@ -389,11 +382,17 @@ class TcpSocket {
     uint16_t RTT_deviation;  // Deviation ( units are clock ticks )
 
 
-    // Flow control: used to tempoarily shrink the receive window on bad connections.
+    // Flow control: used to temporarily shrink the receive window on bad connections.
     uint8_t  consecutiveGoodPackets;
     uint8_t  consecutiveSeqErrs;
     bool     reportSmallWindow;
     bool     padding01;
+
+    #ifndef NOTRACE
+    // Cached human readable destination host and port for tracing purposes.
+    // 000.000.000.000:00000 00000_
+    char     connStr[28];
+    #endif
 
   public:
 
@@ -477,7 +476,7 @@ class TcpSocket {
 
     int8_t near sendPacket( TcpBuffer *buf );
     void   near resendPacket( TcpBuffer *buf );
-    void   near sendPureAck( bool forceProbe = false );
+    void   near sendImmediateAck( bool forceProbe = false );
 
     void   near processSyn( IpHeader *ip, TcpHeader *tcp, uint32_t incomingSeqNum );
 

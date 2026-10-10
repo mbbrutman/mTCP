@@ -1,5 +1,5 @@
 ; mTCP NetDrive (PKT.ASM)
-; Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+; Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
 ; mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 ;
 ;
@@ -31,17 +31,17 @@
 pkt_arp            struc
 pkt_arp_eth_dest   db          6 dup(?)        ; Ethernet dest
 pkt_arp_eth_src    db          6 dup(?)        ; Ethernet source
-pkt_arp_eth_type   dw          ?               ; Ethernet type
-pkt_arp_hdw_type   dw          ?               ; ARP hardware type (0x0001)
-pkt_arp_prot_type  dw          ?               ; ARP protocol type (0x0800)
-pkt_arp_hlen       db          ?               ; ARP hardware length (6)
-pkt_arp_plen       db          ?               ; ARP protocol length (4)
-pkt_arp_op         dw          ?               ; ARP operation (0x0001 request, 0x0002 response)
+pkt_arp_eth_type   dw          0x0608          ; Ethernet type
+pkt_arp_hdw_type   dw          0x0100          ; ARP hardware type (0x0001)
+pkt_arp_prot_type  dw          0x0008          ; ARP protocol type (0x0800)
+pkt_arp_hlen       db          6               ; ARP hardware length (6)
+pkt_arp_plen       db          4               ; ARP protocol length (4)
+pkt_arp_op         dw          0x0200          ; ARP operation (0x0001 request, 0x0002 response)
 pkt_arp_sender_ha  db          6 dup(?)        ; Sender hardware address
 pkt_arp_sender_ip  db          4 dup(?)        ; Sender IP address
 pkt_arp_target_ha  db          6 dup(?)        ; Target hardware address
 pkt_arp_target_ip  db          4 dup(?)        ; Target IP address
-pkt_arp_filler     db          18 dup(?)       ; Advertising space
+pkt_arp_filler     db          "mTCP by M Brutman "
 pkt_arp            ends
 
 
@@ -69,6 +69,21 @@ pkt_ip_dest        db          4 dup(?)
 pkt_ip             ends
 
 
+
+; Command protocol versions
+;
+; 01 - 2023-11: Initial version (Nov 2023)
+; 02 - 2024-07:
+;      More metadata on connect command (required)
+;      New checkpoint commands (optional implementation on the server side)
+; 03 - 2026-03:
+;      Added small payload to the read command for read-ahead (Optional, used if present)
+;      Added padding for new write streaming. (required)
+;      Streaming read-ahead packets get a new code
+
+ND_PROTOCOL_VERSION equ        0x03
+
+
 ; UDP Header, NetDrive Command, and optional NetDrive Payload
 ;
 ; When sending we won't use IP header options so this will appear right after
@@ -76,8 +91,8 @@ pkt_ip             ends
 ; options, so always compute an address to the UDP header before referencing
 ; it.
 
-Udp_Nd_Len         equ         0x16            ; Fixed portion len: UDP and NetDrive hdrs
-Nd_Len             equ         0x0e            ; Just the NetDrive (_nd_) headers part
+UDP_ND_LEN         equ         0x18            ; Fixed portion len: UDP and NetDrive hdrs
+ND_LEN             equ         0x10            ; Just the NetDrive (_nd_) headers part
 
 pkt_udp            struc
 pkt_udp_src        dw          ?
@@ -91,6 +106,7 @@ pkt_nd_op          db          ?               ; netdrive operation
 pkt_nd_result      db          ?               ; return code
 pkt_nd_start       dd          ?               ; 32 bit start LBA
 pkt_nd_count       dw          ?               ; 16 bit number of sectors
+pkt_nd_cmdext      dw          ?               ; Command extension
 pkt_nd_data        db          ?               ; Data starts here
 pkt_udp            ends
 
@@ -113,10 +129,22 @@ Op_Read           equ   3
 Op_Write          equ   4
 Op_Write_Verify   equ   5
 
+; Not used by the driver
+Op_Mark_Chkp      equ   6
+Op_Goto_Chkp      equ   7
+Op_List_Chkp      equ   8
 
-Eth_hdr_len       equ 0x0e      ; Ethernet header length (14 bytes)
+; New and fun
+Op_ReadAheadPkt   equ   0x80
 
-Eth_Type_Arp      equ 0x0608    ; Network byte order
-Eth_Type_Ip       equ 0x0008    ; Network byte order
 
-Ip_Udp_protocol   equ 0x11      ; IP UDP protocol type
+
+ETH_FRAME_SIZE    equ 1514      ; MTU 1500 plus the Ethernet header
+ETH_FRAME_MIN     equ 60        ; Not counting the trailing CRC
+ETH_HDR_LEN       equ 14        ; Ethernet header length
+ETH_TYPE_ARP      equ 0x0608    ; Already swapped for network byte order
+ETH_TYPE_IP       equ 0x0008    ; Already swapped for network byte order
+
+IP_HDR_LEN        equ 20        ; Minimim IP header size (20 bytes, no options)
+IP_UDP_PROTOCOL   equ 17        ; IP UDP protocol type
+IP_HDR_MOREFRAGS  equ 0x2000    ; Flag to set if there are more fragments. (not network byte order)

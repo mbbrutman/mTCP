@@ -38,6 +38,9 @@ objs = dhcp.obj
 
 all : clean dhcp.exe
 
+install : .symbolic
+	@copy dhcp.exe ..\..\execs
+
 clean : .symbolic
   @del dhcp.exe
   @del *.obj

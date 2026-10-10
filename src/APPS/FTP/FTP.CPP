@@ -1,7 +1,7 @@
 /*
 
    mTCP Ftp.cpp
-   Copyright (C) 2009-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -369,7 +369,7 @@ const char NoMatches_msg[] = "No names on the remote server matched.";
 const char Spaces[] = "                                        ";
 
 
-static char CopyrightMsg[] = "mTCP FTP by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2025\nVersion: " __DATE__ "\n";
+static char CopyrightMsg[] = "mTCP FTP by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2026\nVersion: " __DATE__ "\n";
 
 int main( int argc, char *argv[] ) {
 
@@ -670,9 +670,7 @@ int8_t resolveServer( char *name, IpAddr_t addr ) {
 
     if ( !Dns::isQueryPending( ) || CtrlBreakDetected ) break;
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    // Tcp::drivePackets( );
+    Utils::processPackets( );
     Dns::drivePendingQuery( );
 
   }
@@ -1226,9 +1224,7 @@ void pollSocket( TcpSocket *s, uint32_t timeout ) {
 
   while ( 1 ) {
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     int rc = s->recv( inBuf + inBufIndex, (INBUFSIZE - inBufIndex) );
     if ( rc > -1 ) inBufIndex += rc;
@@ -2113,9 +2109,7 @@ int8_t waitForDataSocket( void ) {
       return -1;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     DataSocket = TcpSocketMgr::accept( );
     if ( DataSocket != NULL ) {
@@ -2233,9 +2227,7 @@ int8_t readFileList( void ) {
       break;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     if ( DataSocket->isRemoteClosed( ) ) {
       done = 1;
@@ -2293,9 +2285,7 @@ int8_t readFileList( void ) {
                 fflush( stdout );
 
                 while ( !biosIsKeyReady( ) ) {
-                  PACKET_PROCESS_SINGLE;
-                  Arp::driveArp( );
-                  Tcp::drivePackets( );
+                  Utils::processPackets( );
                 }
 
                 puts("");
@@ -2460,9 +2450,7 @@ int8_t receiveFile( void ) {
       break;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     if ( DataSocket->isRemoteClosed( ) ) {
       // We are done, but stay in the loop so we drain the receive buffer.
@@ -2712,7 +2700,7 @@ int8_t sendFile( void ) {
         // We have a buffer and were able to read from the file.  Set the
         // length of the buffer.
 
-        buf->b.dataLen = bytesToSend;
+        buf->b.setDataLen( bytesToSend );
       }
 
 
@@ -2725,10 +2713,11 @@ int8_t sendFile( void ) {
         break;
       }
 
-      estRemoteWindow = estRemoteWindow - buf->b.dataLen;
-      totalBytesSent += buf->b.dataLen;
+      estRemoteWindow = estRemoteWindow - buf->b.getDataLen( );
+      totalBytesSent += buf->b.getDataLen( );
 
       PACKET_PROCESS_MULT(5);
+      Arp::driveArp( );
       Tcp::drivePackets( );
 
 
@@ -2793,7 +2782,7 @@ int8_t sendFile( void ) {
 
         }
         else {
-          buf->b.dataLen = bytesToSend;
+          buf->b.setDataLen( bytesToSend );
         }
 
       }
@@ -3133,9 +3122,7 @@ int readConsole( char *buffer, int bufLen, bool enableCmdEdit ) {
     // us to respond to ping requests (ICMP) receive TCP packets and send ACKS,
     // but we won't attempt to process until we return back.
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     // Cheap hack - if the user has not entered data and the server sent something
     // then return early to process it.

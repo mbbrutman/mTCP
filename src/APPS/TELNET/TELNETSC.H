@@ -1,7 +1,7 @@
 /*
 
    mTCP TelnetSc.h
-   Copyright (C) 2009-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -105,6 +105,8 @@ class Screen {
       if ( tmp >= bufferSize ) tmp = tmp - bufferSize;
       return tmp;
     }
+
+    bool graphicsAllowed( void );
 
     void restoreTextMode( void );
 

@@ -1,7 +1,7 @@
 /*
 
    mTCP Telnet.H
-   Copyright (C) 2009-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -37,10 +37,10 @@
 
 #define TEL_IAC  (255)
 
-#define TELCMD_WILL (251)
-#define TELCMD_WONT (252)
-#define TELCMD_DO   (253)
-#define TELCMD_DONT (254)
+#define TELCMD_WILL (251)    // 0xFB
+#define TELCMD_WONT (252)    // 0xFC
+#define TELCMD_DO   (253)    // 0xFD
+#define TELCMD_DONT (254)    // 0xFE
 
 #define TELCMD_SUBOPT_BEGIN (250)
 #define TELCMD_SUBOPT_END   (240)
@@ -56,18 +56,42 @@
 #define TELCMD_IP     (244)  // Interrupt process
 #define TELCMD_AO     (245)  // Abort output
 #define TELCMD_AYT    (246)  // Are you there?
-#define TELCMD_EC     (247)  // Escape character (Or is it Erase?)
-#define TELCMD_GA     (248)  // Go ahead
+#define TELCMD_EC     (247)  // Erase character
+#define TELCMD_EL     (248)  // Erase character
+#define TELCMD_GA     (249)  // Go ahead
 
+
+// Telnet options our Telnet client supports
 
 #define TELOPT_BIN       (0)  // Binary transmission
 #define TELOPT_ECHO      (1)  // Echo
 #define TELOPT_SGA       (3)  // Suppress go ahead
+#define TELOPT_TERMTYPE (24)  // Terminal type
+#define TELOPT_WINDSIZE (31)  // Window Size
+
+// A "dummy" option that we use locally that will never be implemented
+//
+// We need a byte of storage in an array for each option we support.
+// The "dummy" option is a catch-all that we use for options that
+// we don't support.  It defaults to "We won't ask for it" and
+// "We won't do it."
+//
+// We could save space by not allocation a byte of storage for the
+// options ware are not using, but then that leads to more code so
+// it doesn't work out.
+#define TELOPT_DUMMY     (2)
+
+// If you add support for an option number above TELOPT_WINDSIZE then
+// you need to adjust this count to grow the options array.
+#define TEL_OPTION_COUNT (32)
+
+
+
+// Other Telnet options that might be interesting someday.
+
 #define TELOPT_STATUS    (5)  // Status
 #define TELOPT_TM        (6)  // Timing mark
 #define TELOPT_SENDLOC  (23)  // Send location
-#define TELOPT_TERMTYPE (24)  // Terminal type
-#define TELOPT_WINDSIZE (31)  // Window Size
 #define TELOPT_TERMSPD  (32)  // Terminal speed
 #define TELOPT_RFC      (33)  // Remote Flow Control
 #define TELOPT_LINEMODE (34)  // Linemode
@@ -77,10 +101,11 @@
 #define TELOPT_ENCRYPT  (38)  // Encryption
 #define TELOPT_NEWENV   (39)  // New Environment
 
-#define TEL_OPTIONS     (42)
 
+
+// Maximum length of a terminal type name is 40 characters.  Space is defined
+// for a trailing NULL character, but that is not transmitted.
 #define TEL_TERMTYPE_LEN (41) // Includes the NULL
-
 
 
 // One new line and two new lines
@@ -98,12 +123,12 @@ class TelnetOpts {
     TelnetOpts( ) { reset( ); }
     void reset( void ) { memset( this, 0, sizeof( TelnetOpts ) ); }
 
-    // State for Remote and Local
+    // The state of each option, both local and remote is incoded in the first two bits.
 
-    inline uint8_t isRmtOn( uint8_t opt ) { return ((optArr[opt] & 0x01) == 0x01); }
-    inline uint8_t isRmtOff( uint8_t opt ) { return ((optArr[opt] & 0x01) == 0x00); }
-    inline uint8_t isLclOn( uint8_t opt )   { return ((optArr[opt] & 0x02) == 0x02); }
-    inline uint8_t isLclOff( uint8_t opt ) { return ((optArr[opt] & 0x02) == 0x00); }
+    inline bool isRmtOn( uint8_t opt ) { return ((optArr[opt] & 0x01) == 0x01); }
+    inline bool isRmtOff( uint8_t opt ) { return ((optArr[opt] & 0x01) == 0x00); }
+    inline bool isLclOn( uint8_t opt )   { return ((optArr[opt] & 0x02) == 0x02); }
+    inline bool isLclOff( uint8_t opt ) { return ((optArr[opt] & 0x02) == 0x00); }
 
     inline void setRmtOn( uint8_t opt ) { optArr[opt] |= 0x01; }
     inline void setRmtOff( uint8_t opt ) { optArr[opt] &= 0xFE; }
@@ -111,13 +136,12 @@ class TelnetOpts {
     inline void setLclOff( uint8_t opt ) { optArr[opt] &= 0xFD; }
 
 
-    // Desired state for Remote and Local
+    // For each option (both local and remote), will we allow it if asked or offered?
 
-    inline uint8_t isWantRmtOn( uint8_t opt )  { return ((optArr[opt] & 0x04) == 0x04); }
-    inline uint8_t isWantRmtOff( uint8_t opt ) { return ((optArr[opt] & 0x04) == 0x00); }
-    inline uint8_t isWantLclOn( uint8_t opt )  { return ((optArr[opt] & 0x08) == 0x08); }
-    inline uint8_t isWantLclOff( uint8_t opt ) { return ((optArr[opt] & 0x08) == 0x00); }
-
+    inline bool isWantRmtOn( uint8_t opt )  { return ((optArr[opt] & 0x04) == 0x04); }
+    inline bool isWantRmtOff( uint8_t opt ) { return ((optArr[opt] & 0x04) == 0x00); }
+    inline bool isWantLclOn( uint8_t opt )  { return ((optArr[opt] & 0x08) == 0x08); }
+    inline bool isWantLclOff( uint8_t opt ) { return ((optArr[opt] & 0x08) == 0x00); }
 
     inline void setWantRmtOn( uint8_t opt )  { optArr[opt] |= 0x04; }
     inline void setWantRmtOff( uint8_t opt ) { optArr[opt] &= 0xFB; }
@@ -125,10 +149,10 @@ class TelnetOpts {
     inline void setWantLclOff( uint8_t opt ) { optArr[opt] &= 0xF7; }
 
 
-    // Did we send an option and are waiting for a response?
+    // Flip a bit if we asked for something so that we don't get into a response loop.
 
-    inline uint8_t isWillOrWontPending( uint8_t opt ) { return ((optArr[opt] & 0x10) == 0x10); }
-    inline uint8_t isDoOrDontPending( uint8_t opt )   { return ((optArr[opt] & 0x20) == 0x20); }
+    inline bool isWillOrWontPending( uint8_t opt ) { return ((optArr[opt] & 0x10) == 0x10); }
+    inline bool isDoOrDontPending( uint8_t opt )   { return ((optArr[opt] & 0x20) == 0x20); }
 
     inline void setWillOrWontPending( uint8_t opt ) { optArr[opt] |= 0x10; };
     inline void clrWillOrWontPending( uint8_t opt ) { optArr[opt] &= 0xEF; };
@@ -136,9 +160,9 @@ class TelnetOpts {
     inline void clrDoOrDontPending( uint8_t opt )   { optArr[opt] &= 0xDF; };
 
 
-  private:
+//  private:
 
-    uint8_t optArr[ TEL_OPTIONS ];
+    uint8_t optArr[ TEL_OPTION_COUNT ];
 
 };
 

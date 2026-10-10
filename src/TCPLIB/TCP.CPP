@@ -1,7 +1,7 @@
 /*
 
    mTCP Tcp.cpp
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -57,6 +57,9 @@
 #include <string.h>
 #include <dos.h>
 
+#include "tcp.h"
+#include "tcpsockm.h"
+
 #include "timer.h"
 #include "trace.h"
 #include "utils.h"
@@ -66,8 +69,6 @@
 #include "eth.h"
 #include "ip.h"
 
-#include "tcp.h"
-#include "tcpsockm.h"
 
 
 
@@ -103,17 +104,15 @@ void Tcp::dumpStats( FILE *stream ) {
 //
 TcpBuffer *TcpBuffer::xmitBuffers[TCP_MAX_XMIT_BUFS];
 uint8_t    TcpBuffer::freeXmitBuffers;          // Number of buffers in the list
-uint8_t    TcpBuffer::allocatedXmitBuffers;     // Total number of buffers allocated
 void      *TcpBuffer::xmitBuffersMemPtr = NULL; // Use this to deallocate the memory
-
 
 
 int8_t TcpBuffer::init( uint8_t xmitBufs_p ) {
 
-  allocatedXmitBuffers = freeXmitBuffers = 0;
+  freeXmitBuffers = 0;
 
   if ( xmitBufs_p > TCP_MAX_XMIT_BUFS ) {
-    TRACE_TCP_WARN(( "Tcp: TcpBuffers parm (%u) too big, limit=%u:\n", xmitBufs_p, TCP_MAX_XMIT_BUFS ));
+    TRACE_TCP_WARN(( "Tcp: TcpBuffers parm (%u) too big, limit is %u:\n", xmitBufs_p, TCP_MAX_XMIT_BUFS ));
     return TCP_RC_BAD;
   }
 
@@ -127,15 +126,18 @@ int8_t TcpBuffer::init( uint8_t xmitBufs_p ) {
   uint8_t *tmp = (uint8_t *)mTCP_malloc( tmpSize, "LIB_TCP_xmit_bufs" );
 
   if ( tmp == NULL ) {
-    TRACE_TCP_WARN(( "Tcp: Mem alloc err on TcpBuffers\n" ));
+    TRACE_TCP_WARN(( "Tcp: Not enough memory for TcpBuffers\n" ));
     return TCP_RC_BAD;
   }
 
+  // We don't need to clear the storage of the buffers or initialize them,
+  // except for the bufferPool flag.  All of the fields are set either by
+  // the user or re-initialized each time a buffer is grabbed from the pool.
+
+  freeXmitBuffers = xmitBufs_p;
   xmitBuffersMemPtr = tmp;
-  freeXmitBuffers = allocatedXmitBuffers = xmitBufs_p;
 
-
-  for ( uint8_t i=0; i < allocatedXmitBuffers; i++ ) {
+  for ( uint8_t i=0; i < xmitBufs_p; i++ ) {
 
     #if defined(__TINY__) || defined(__SMALL__) || defined(__MEDIUM__)
 
@@ -150,7 +152,7 @@ int8_t TcpBuffer::init( uint8_t xmitBufs_p ) {
       // segment so the chances on a pointer being near the end of the
       // segment are pretty slim anyway.
 
-      xmitBuffers[i] = (TcpBuffer *)(tmp+(i*bufSize));
+      xmitBuffers[i] = (TcpBuffer *)tmp;
 
     #else
 
@@ -162,9 +164,8 @@ int8_t TcpBuffer::init( uint8_t xmitBufs_p ) {
       // This is slightly expensive, but we only do it once for the life
       // of a buffer pointer.
 
-      uint8_t *t = tmp+(i*bufSize);
-      uint16_t seg = FP_SEG( t );
-      uint16_t off = FP_OFF( t );
+      uint16_t seg = FP_SEG( tmp );
+      uint16_t off = FP_OFF( tmp );
       seg = seg + (off/16);
       off = off & 0x000F;
       xmitBuffers[i] = (TcpBuffer *)MK_FP( seg, off );
@@ -172,6 +173,8 @@ int8_t TcpBuffer::init( uint8_t xmitBufs_p ) {
     #endif
 
     xmitBuffers[i]->bufferPool = 1; // Indicate this buffer is pool managed.
+
+    tmp = tmp + bufSize;
   }
 
   return TCP_RC_GOOD;
@@ -182,6 +185,30 @@ void TcpBuffer::stop( void ) {
   if ( xmitBuffersMemPtr != NULL ) free( xmitBuffersMemPtr );
 }
 
+
+// These used to be inline functions but they are a bit bigger than they
+// look and the extra call overhead isn't going to matter considering
+// the entire path, so just make them outline to save space.
+
+TcpBuffer *TcpBuffer::getXmitBuf( void ) {
+  if (freeXmitBuffers) {
+    freeXmitBuffers--;
+    return xmitBuffers[freeXmitBuffers];
+  }
+  else { return NULL; };
+}
+
+
+void TcpBuffer::returnXmitBuf( TcpBuffer *tmp ) {
+  // Defend against returning a buffer that doesn't belong to the pool.
+  // In particular, this refers to the tiny statically allocated packet
+  // in each socket that we use for the three way handshake or ACK
+  // packets with no data.
+  if ( tmp->bufferPool ) {
+    xmitBuffers[freeXmitBuffers] = tmp;
+    freeXmitBuffers++;
+  }
+}
 
 
 
@@ -298,11 +325,9 @@ TcpSocket::TcpSocket( ) {
 
 void TcpSocket::reinit( ) {
 
-  TRACE_TCP(( "Tcp: (%08lx) Re-init\n", this ));
+  TRACE_TCP(( "Tcp: (%p) Reinit socket\n", this ));
 
-  // Brutal, but effective.
   memset( this, 0, sizeof( TcpSocket ) );
-
 
   // Generate a 32 random number for seqNum.  The random number generator
   // only gives us 16 bits and the high bit is never on, but it is good
@@ -321,24 +346,25 @@ void TcpSocket::reinit( ) {
 
   oldestUnackedSeq = seqNum = tmp.big;
 
-  ackNum = 0;
+
+  // Set other non-zero fields.
+
   state = TCP_STATE_CLOSED;
-  disableReads = 0;
-  pendingAccept = 0;
 
   lastActivity = TIMER_GET_CURRENT( );
   lastAckRcvd = lastActivity;
 
-  closeReason = 0;
 
-  closeStarted = 0;
+  // This is not my normal coding style.  I usually leave things like this
+  // in the code just in case somebody changes my ringbuffer code some day,
+  // but in this case the init calls just set three fields to 0 and that is
+  // already done by the memset above.  Commenting these out saves 58 bytes
+  // of absolutely useless code.
+  //
+  // outgoing.init( );
+  // sent.init( );
+  // incoming.init( );
 
-  outgoing.init( );
-  sent.init( );
-  incoming.init( );
-
-  rcvBuffer = NULL;
-  rcvBufSize = rcvBufFirst = rcvBufLast = rcvBufEntries = 0;
 
   // Set to unitialized state
   Eth::copy( cachedMacAddr, Eth::Eth_Broadcast );
@@ -347,14 +373,7 @@ void TcpSocket::reinit( ) {
   // Retransmit timer data
 
   SRTT = TCP_MAX_SRTT; // Initial smoothed RTT ( units are clock ticks )
-  RTT_deviation = 0;   // Start with no deviation ( units are clock ticks )
 
-
-  // Flow control: Used to shrink the receive window on bad connections.
-
-  consecutiveGoodPackets = 0;
-  consecutiveSeqErrs = 0;
-  reportSmallWindow = false;
 }
 
 
@@ -369,44 +388,34 @@ void TcpSocket::reinit( ) {
 // needed it set on those, you should have set the parm on the listen
 // call.)
 
-int8_t TcpSocket::setRecvBuffer( uint16_t recvBufferSize_p ) {
+int8_t TcpSocket::setRecvBuffer( uint16_t rcvBufferSize_p ) {
 
-  if ( recvBufferSize_p == 0 ) {
-    // Don't make a recv buffer.
-    return TCP_RC_GOOD;
-  }
-
-  if ( (recvBufferSize_p < 512) || (recvBufferSize_p > 16384) ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Bad recvBufferSize specified: %u\n",
-                     this,
-                     dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                     recvBufferSize_p ));
+  if ( rcvBufSize ) {
+    // You called this already and that should be visible by code inspection.
     return TCP_RC_BAD;
   }
 
-
-  rcvBufSize = recvBufferSize_p;
+  if ( (rcvBufferSize_p < 512) || (rcvBufferSize_p > 16384) ) {
+    TRACE_TCP_WARN(( "Tcp: (%p) Bad recv buffer size: %u\n", this, rcvBufferSize_p ));
+    return TCP_RC_BAD;
+  }
 
   // The receive buffer is a ring buffer.  Allocate one extra byte
   // so that we don't have to worry about boundary conditions.
+  rcvBufferSize_p++;
 
-  rcvBuffer = (uint8_t *)mTCP_malloc( rcvBufSize + 1, "LIB_TCP_socket_recv_buf" );
+  rcvBuffer = (uint8_t *)mTCP_malloc( rcvBufferSize_p, "LIB_TCP_socket_recv_buf" );
   if ( rcvBuffer == NULL ) {
-    // This is kind of bad, but not fatal.  Woe to the user who does
-    // not check return codes.
-    TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Failed to allocate rcvbuf\n",
-                     this, dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort ));
-    rcvBufSize = 0;
+    // This is bad, but not fatal.  Woe to the user who does not check return codes.
+    TRACE_TCP_WARN(( "Tcp: (%p) Failed to allocate recv buffer %u\n", this, rcvBufferSize_p ));
     return TCP_RC_BAD;
   }
 
-  TRACE_TCP(( "Tcp: (%08lx) Recv buffer set to %u\n", this, rcvBufSize ));
-
+  rcvBufSize = rcvBufferSize_p;
+  TRACE_TCP(( "Tcp: (%p) Recv buffer set to %u\n", this, rcvBufSize ));
 
   return TCP_RC_GOOD;
 }
-
-
 
 
 
@@ -418,10 +427,8 @@ int8_t TcpSocket::setRecvBuffer( uint16_t recvBufferSize_p ) {
 int8_t near TcpSocket::connect2( uint16_t srcPort_p, IpAddr_t host_p, uint16_t dstPort_p ) {
 
   if ( state != TCP_STATE_CLOSED ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Tried to connect with a non CLOSED socket (%s)\n",
-                     this,
-                     dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                     TcpSocket::StateDesc[state] ));
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Tried to connect with a non CLOSED socket (%s)\n",
+                     this, connStr, TcpSocket::StateDesc[state] ));
     return TCP_RC_BAD;
   }
 
@@ -429,26 +436,28 @@ int8_t near TcpSocket::connect2( uint16_t srcPort_p, IpAddr_t host_p, uint16_t d
   Ip::copy( dstHost, host_p );
   dstPort = dstPort_p;
 
+  #ifndef NOTRACE
+  sprintf( connStr, "%u.%u.%u.%u:%u %u", dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort );;
+  #endif
+
   TcpSocketMgr::makeActive( this );
 
-  TRACE_TCP(( "Tcp: (%08lx) Connecting to %d.%d.%d.%d:%u from port %u\n",
-              this,
-              dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort,
-              srcPort
-  ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Connecting\n", this, connStr));
 
 
   // First packet is the SYN packet.  Data length of the packet is
   // zero, but 1 will get added to the sequence number in the send code.
   state = TCP_STATE_SYN_SENT;
 
+
+  // We're using our tiny statically allocated packet for this because we know
+  // that during the three way handshake that there is no threat that it will
+  // be used while it is active doing this.
   connectPacket.pkt.dataLen = 0;
 
-
-  // No need to check the return code because this socket has no traffic yet
-  // and we are well below any MSS limits.
+  // There is no need to check the return code because this socket has no
+  // traffic yet and we are well below any MSS limits.
   enqueue( &connectPacket.pkt );
-
 
   // Somebody has to get in a loop now to process TCP and ARP packets
 
@@ -484,17 +493,14 @@ int8_t TcpSocket::connect( uint16_t srcPort_p, IpAddr_t host_p, uint16_t dstPort
 
   while ( 1 ) {
 
-    PACKET_PROCESS_SINGLE;
-    Tcp::drivePackets( );
-    Arp::driveArp( );
-
+    Utils::processPackets( );
 
     // Established is obvious, but Close_Wait is not so obvious.  There is
     // a timing window where they could send data and a FIN bit, pushing us
     // to CLOSE_WAIT very quickly.
 
     if ( isConnectComplete( ) ) {
-      TRACE_TCP(( "Tcp: (%08lx) Connected\n", this ));
+      TRACE_TCP(( "Tcp: (%p) (%s) Connected\n", this, connStr ));
       return TCP_RC_GOOD;
     }
 
@@ -507,7 +513,7 @@ int8_t TcpSocket::connect( uint16_t srcPort_p, IpAddr_t host_p, uint16_t dstPort
     lastCheck = TIMER_GET_CURRENT( );
   }
 
-  TRACE_TCP(( "Tcp: (%08lx) Timeout\n", this ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Connect timeout\n", this, connStr ));
 
   // Should we close the socket?
 
@@ -542,7 +548,9 @@ int8_t TcpSocket::connectNonBlocking( uint16_t srcPort_p, IpAddr_t host_p, uint1
 // dropped.
 //
 // The recvBufferSize parameter is for the new sockets that are created
-// as the result of the listen, not for the listening socket.
+// as the result of the listen, not for the listening socket.  As a result,
+// even when it is non-zero a receive buffer is not created for this specific
+// socket.
 //
 // Note: We do not support listening bound to a specific machine and port!
 // Part of the reason is that is rarely used.  If we need it then somebody
@@ -558,7 +566,7 @@ int8_t TcpSocket::connectNonBlocking( uint16_t srcPort_p, IpAddr_t host_p, uint1
 int8_t TcpSocket::listen( uint16_t srcPort_p, uint16_t recvBufferSize ) {
 
   if ( state != TCP_STATE_CLOSED ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Tried to listen on a socket that was in state %s\n",
+    TRACE_TCP_WARN(( "Tcp: (%p) Tried to listen on a socket that was in state %s\n",
                      this, TcpSocket::StateDesc[ state ] ));
     return TCP_RC_BAD;
   }
@@ -581,9 +589,13 @@ int8_t TcpSocket::listen( uint16_t srcPort_p, uint16_t recvBufferSize ) {
   dstHost[0] = dstHost[1] = dstHost[2] = dstHost[3] = 0;
   dstPort = 0;
 
+  #ifndef NOTRACE
+  sprintf( connStr, "0.0.0.0:0 %u", srcPort );
+  #endif
+
   TcpSocketMgr::makeActive( this );
 
-  TRACE_TCP(( "Tcp: (%08lx) Listening on port %u\n", this, srcPort ));
+  TRACE_TCP(( "Tcp: (%p) Listening on port %u\n", this, srcPort ));
 
   state = TCP_STATE_LISTEN;
 
@@ -592,6 +604,7 @@ int8_t TcpSocket::listen( uint16_t srcPort_p, uint16_t recvBufferSize ) {
   // It is only for handshaking.
   shutdown( TCP_SHUT_RD );
 
+  // Note the size of the receive buffer that any pending sockets should get.
   rcvBufSize = recvBufferSize;
 
   return TCP_RC_GOOD;
@@ -604,7 +617,7 @@ int8_t TcpSocket::listen( uint16_t srcPort_p, uint16_t recvBufferSize ) {
 // Fixme: Why have a return code here?
 int8_t TcpSocket::shutdown( uint8_t how ) {
 
-  TRACE_TCP(( "Tcp: (%08lx) Shutdown=%d\n", this, how ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Shutdown=%d\n", this, connStr, how ));
 
   switch ( how ) {
 
@@ -658,8 +671,8 @@ int8_t near TcpSocket::closeLocal( void ) {
   // Not every state change requires a FIN to be sent.
   uint8_t sendPacket = 0;
 
-  TRACE_TCP(( "Tcp: (%08lx) closeLocal: State was %s\n",
-          this, TcpSocket::StateDesc[state] ));
+  TRACE_TCP(( "Tcp: (%p) (%s) closeLocal: State was %s\n",
+              this, connStr, TcpSocket::StateDesc[state] ));
 
   switch ( state ) {
 
@@ -694,10 +707,8 @@ int8_t near TcpSocket::closeLocal( void ) {
     // again is a user error.
 
     default: {
-      TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Should not close a socket in state %s\n",
-                       this,
-                       dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                       TcpSocket::StateDesc[state] ));
+      TRACE_TCP_WARN(( "Tcp: (%p) (%s) Should not close a socket in state %s\n",
+                       this, connStr, TcpSocket::StateDesc[state] ));
       break;
     }
 
@@ -740,19 +751,14 @@ void TcpSocket::close( void ) {
 
   if ( closeStarted == 0 ) closeStarted = TIMER_GET_CURRENT( );
 
-  TRACE_TCP(( "Tcp: (%08lx) Close (blocking)\n", this ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Close (blocking)\n", this, connStr ));
 
   // Start the process
   closeLocal( );
 
   // Loop until it goes away
-
   while ( !isCloseDone( ) ) {
-
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
-
+    Utils::processPackets( );
   }
 
 }
@@ -769,13 +775,13 @@ void TcpSocket::close( void ) {
 
 void TcpSocket::closeNonblocking( void ) {
 
+  TRACE_TCP(( "Tcp: (%p) (%s) Close (nonblocking)\n", this, connStr ));
+
   // Only set closeStarted if it has not been set before.
   // This protects us against a user error where they keep trying to
   // close the socket (and thus reseting the time each time they do).
 
   if ( closeStarted == 0 ) closeStarted = TIMER_GET_CURRENT( );
-
-  TRACE_TCP(( "Tcp: (%08lx) Close (nonblocking)\n", this ));
 
   // Start the process
   closeLocal( );
@@ -806,8 +812,8 @@ int8_t TcpSocket::isCloseDone( void ) {
 
   // It has not closed on its own.  Cut a warning message and destroy it.
 
-  TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Timeout waiting for close, State = %s\n",
-                   this, dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort, TcpSocket::StateDesc[state] ));
+  TRACE_TCP_WARN(( "Tcp: (%p) (%s) Timeout waiting for close, State = %s\n",
+                   this, connStr, TcpSocket::StateDesc[state] ));
 
   destroy( );
   closeReason = 2; // It was forced
@@ -818,24 +824,17 @@ int8_t TcpSocket::isCloseDone( void ) {
 
 void near TcpSocket::clearQueues( void ) {
 
-  TcpBuffer *xmitBuffer;
-
-  int tmp = outgoing.entries;
-  while ( outgoing.entries ) {
-    xmitBuffer = ((TcpBuffer *)outgoing.dequeue( ));
+  while ( TcpBuffer *xmitBuffer = ((TcpBuffer *)outgoing.dequeue( )) ) {
     TcpBuffer::returnXmitBuf( xmitBuffer );
+    Tcp::Pending_Outgoing--;
   }
-  Tcp::Pending_Outgoing = Tcp::Pending_Outgoing - tmp;
 
-  tmp = sent.entries;
-  while ( sent.entries ) {
-    xmitBuffer = ((TcpBuffer *)sent.dequeue( ));
+  while ( TcpBuffer *xmitBuffer = ((TcpBuffer *)sent.dequeue( )) ) {
     TcpBuffer::returnXmitBuf( xmitBuffer );
+    Tcp::Pending_Sent--;
   }
-  Tcp::Pending_Sent = Tcp::Pending_Sent - tmp;
 
-  while ( incoming.entries ) {
-    uint8_t *packet = ((uint8_t *)incoming.dequeue( ));
+  while ( uint8_t *packet = ((uint8_t *)incoming.dequeue( )) ) {
     Buffer_free( packet );
   }
 
@@ -849,7 +848,7 @@ void near TcpSocket::clearQueues( void ) {
 
 void TcpSocket::destroy( void ) {
 
-  TRACE_TCP(( "Tcp: (%08lx) Destroy   Final SRTT: (%u, %u)\n", this, SRTT, RTT_deviation ));
+  TRACE_TCP(( "Tcp: (%p) Destroy, Final SRTT: (%u, %u)\n", this, SRTT, RTT_deviation ));
 
   // Clear the queues to a known good state.
   clearQueues( );
@@ -908,37 +907,56 @@ void near TcpSocket::setMaxEnqueueSize( TcpHeader *tcp ) {
     maxEnqueueSize = TcpSocketMgr::MSS_to_advertise;
   }
 
-  TRACE_TCP(( "Tcp: (%08lx) Remote MSS=%u\n", this, remoteMSS ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Remote MSS=%u\n", this, connStr, remoteMSS ));
 }
 
 
 
-
-// Users don't send packets, they enqueue them.
+// enqueue
 //
-// Returns TCP_RC_GOOD if successful
-// Returns TCP_RC_BAD if the enqueue fails
-// Returns -2 if the packet is too big.
+// TCP data is sent by getting an xmit buffer and copying data into it.  The
+// xmit buffer is then added to a queue to be sent.  This function handles
+// the adding to the queue, and drivePackets is what sends them out.
+//
+// Calls to TcpSocket::send wrapper the process of getting an xmit buffer
+// and enqueuing it.  send is also nicer in that it will loop and do that
+// until there are no more bytes to send or there are no more xmit buffers
+// available.
+//
+// The reasoning for doing it this way is that it may be more efficient
+// to prepare a few outgoing packets to send than it would be to send
+// everything one at a time.  The caller gets the choice by choosing
+// when to call Tcp::drivePackets.
+//
+// On entry set:
+//   dataLen
+//   User data (after the TCP headers in the xmit buffer)
+//
+// Returns
+//   TCP_RC_GOOD if successful
+//   TCP_RC_BAD if the enqueue fails
+//   TCP_RC_TOO_MUCH_DATA if the packet is too big.
 
 int16_t TcpSocket::enqueue( TcpBuffer *buf ) {
 
   if ( (state == TCP_STATE_CLOSED || state == TCP_STATE_LISTEN || state == TCP_STATE_CLOSING ) ||
        ((state == TCP_STATE_TIME_WAIT) && (buf != &connectPacket.pkt) ) ) {
 
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Tried to enqueue a packet while in state %s\n",
-                 this, TcpSocket::StateDesc[state] ));
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Tried to enqueue a packet while in state %s\n",
+                 this, connStr, TcpSocket::StateDesc[state] ));
     return TCP_RC_BAD;
   }
 
   if ( buf->dataLen > maxEnqueueSize ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Tried to enqueue oversized segment, len=%d\n",
-                 this, buf->dataLen ));
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Tried to enqueue oversized segment, len=%d\n",
+                 this, connStr, buf->dataLen ));
     return TCP_RC_TOO_MUCH_DATA;
   }
 
 
+  TRACE_TCP(( "Tcp: (%p) (%s) Enqueue: buf=%p, (pre) outgoing=%u\n",
+              this, connStr, buf, outgoing.entries ));
 
-  #ifdef TCP_OPT_ENQUEUED_ACKS
 
   // If there is just one packet enqueued so far and it is an empty packet
   // with just ACK set, then discard it and use this packet instead.  This
@@ -953,15 +971,12 @@ int16_t TcpSocket::enqueue( TcpBuffer *buf ) {
     TcpBuffer *first = (TcpBuffer *)outgoing.peek( );
 
     if ( first->dataLen == 0 ) {
-      TRACE_TCP(( "Tcp: Enqueue: Piggybacking on existing ACK\n" ));
+      TRACE_TCP(( "     Enqueue: Dropping empty ACK packet\n" ));
       outgoing.dequeue( );
       TcpBuffer::returnXmitBuf( first );
     }
 
   }
-
-  #endif
-    
 
 
   // Update last activity time on the socket
@@ -974,15 +989,14 @@ int16_t TcpSocket::enqueue( TcpBuffer *buf ) {
   buf->flags = 0;
   buf->rc = 0;
 
-  // Ringbuffer enqueue returns 0 if good, -1 if bad
-  //return outgoing.enqueue( buf );
+  if ( outgoing.enqueue( buf ) ) {
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Outgoing enqueue failed\n", this, connStr ));
+    return TCP_RC_BAD;
+  }
 
-  int16_t rc = outgoing.enqueue( buf );
-  if ( rc == 0 ) {
-    Tcp::Pending_Outgoing++;
-  };
+  Tcp::Pending_Outgoing++;
+  return TCP_RC_GOOD;
 
-  return rc;
 }
 
 
@@ -990,21 +1004,32 @@ int16_t TcpSocket::enqueue( TcpBuffer *buf ) {
 
 // resendPacket
 //
-// Assumes ARP resolution is done already, and that we are resending
-// because of a dropped packet.  But we'll re-ARP just in case.
+// Assumes ARP resolution is done already, and that we are resending because
+// of a dropped packet.
 
 void near TcpSocket::resendPacket( TcpBuffer *buf ) {
 
   TcpPacket_t* packetPtr = &buf->headers;
 
-  TRACE_TCP(( "Tcp: (%08lx) Resend: Buf=%08lx Seq=%08lx Tries=%u\n",
-          this, buf, ntohl( packetPtr->tcp.seqnum ), buf->attempts ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Resend: buf=%p, SEQ=%08lx, tries=%u\n",
+          this, connStr, buf, ntohl( packetPtr->tcp.seqnum ), buf->attempts ));
 
   // Some voodoo ... this should not be needed and won't complete in time
   // for this packet going out, but kick off an ARP request just in case.
   // We retry a few times so this should help later packets if a router
   // is going numb on us.  (Looking at you Asus.)
-  Arp::sendArpRequestPacket( buf->headers.ip.ip_dest );
+
+  IpAddr_t tmp;
+  Ip::copy(tmp, buf->headers.ip.ip_dest);
+
+  uint32_t tmp_u = *(uint32_t *)(&tmp);
+
+  if ( (MyIpAddr_u & Netmask_u) != (tmp_u & Netmask_u) ) {
+    Ip::copy(tmp, Gateway);
+  }
+
+  Arp::sendArpRequestPacket( tmp );
+
 
   // We do redo the IP header because the IP ident field should be changed
   // on a resent packet, which requires a new checksum.  We are definitely
@@ -1022,14 +1047,17 @@ void near TcpSocket::resendPacket( TcpBuffer *buf ) {
 
 // sendPacket
 //
+// Fill in the buffer metadata and protocol headers to send a packet.  Also
+// kicks off ARP resolution if needed.
+//
 // Returns 0 if the packet was sent (no ARP resolution pending)
 // Returns 1 if ARP resolution is pending
 
 
 int8_t near TcpSocket::sendPacket( TcpBuffer *buf ) {
 
-  TRACE_TCP(( "Tcp: (%08lx) Send: State=%s  Buf=%08lx DataLen=%u  RmtWin=%u\n",
-              this, TcpSocket::StateDesc[state], buf, buf->dataLen, remoteWindow ));
+  TRACE_TCP(( "Tcp: (%p) (%s) SendPkt: state=%s, buf=%p, dataLen=%u, rmtWin=%u\n",
+              this, connStr, TcpSocket::StateDesc[state], buf, buf->dataLen, remoteWindow ));
 
   // If we have filled this packet in before and it is just pending
   // Arp resolution then retry just that part.
@@ -1039,7 +1067,7 @@ int8_t near TcpSocket::sendPacket( TcpBuffer *buf ) {
     buf->pendingArp = buf->headers.ip.setDestEth( buf->headers.eh.dest );
 
     if ( buf->pendingArp == 0 ) {
-      TRACE_TCP(( "     Arp satisfied\n" ));
+      TRACE_TCP(( "     Resending now that Arp is satisfied\n" ));
       Eth::copy( cachedMacAddr, buf->headers.eh.dest );
       Packet_send_pkt( &buf->headers, buf->packetLen );
     }
@@ -1051,25 +1079,28 @@ int8_t near TcpSocket::sendPacket( TcpBuffer *buf ) {
 
   buf->packetLen = sizeof(TcpPacket_t) + buf->dataLen;
 
-  TcpPacket_t* packetPtr = &buf->headers;
 
   // Fill in the TCP header.
+
+  TcpPacket_t* packetPtr = &buf->headers;
 
   packetPtr->tcp.src = htons( srcPort );
   packetPtr->tcp.dst = htons( dstPort );
 
+  // If this is a probe packet we want to force a response from the other
+  // side, so set SEQ in the packet to be 1 less than it is supposed to be.
+  // Otherwise, just set it as expected.
+  //
+  // Update our expected SEQ number either way, after the packet SEQ num is set.
 
-  packetPtr->tcp.seqnum = htonl( seqNum );
-  seqNum += buf->dataLen;
-
-  // Another global variable kludge. Instead of sending a pure ack packet
-  // which won't get acknowledged, we need to put the sequence number just
-  // out of window. That will force an ACK to come back to us.
-  if ( buf->isForceProbe( ) ) {
+  if ( buf->isForceProbe( ) == false ) {
+    packetPtr->tcp.seqnum = htonl( seqNum );
+  } else {
     uint32_t tmp = seqNum-1;
     packetPtr->tcp.seqnum = htonl( tmp );
   }
 
+  seqNum += buf->dataLen;
 
   packetPtr->tcp.setTcpHlen( 20 );
 
@@ -1202,7 +1233,7 @@ int8_t near TcpSocket::sendPacket( TcpBuffer *buf ) {
   // problem when there is more than one packet outstanding.  We do this
   // until things clear up, and then resume using the correct window size.
   //
-  // As per RFC 793, advertising a window and the advertisign a much smaller
+  // As per RFC 793, advertising a window and the advertising a much smaller
   // window is known as "shrinking the window" and it is "strongly discouraged."
   // What we are doing here can be seen as anti-social, but it's also an
   // exceptional error handling case.  To handle it properly we need to remember
@@ -1228,10 +1259,8 @@ int8_t near TcpSocket::sendPacket( TcpBuffer *buf ) {
     // Should not have gotten here.  If we did it means that somehow we
     // violated their remote window.  Put a warning or consistency check
     // here.
-    TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Sent %u bytes when window was %u\n",
-                     this,
-                     dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                     buf->dataLen, remoteWindow ));
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Sent %u bytes when window was %u\n",
+                     this, connStr, buf->dataLen, remoteWindow ));
     remoteWindow = 0;
   }
 
@@ -1241,7 +1270,7 @@ int8_t near TcpSocket::sendPacket( TcpBuffer *buf ) {
   packetPtr->tcp.urgent = 0;
 
 
-  TRACE_TCP(( "     Seq=%08lx  Ack=%08lx  MyWin=%u\n",
+  TRACE_TCP(( "     SEQ=%08lx, ACK=%08lx, lclWin=%u\n",
               ntohl(packetPtr->tcp.seqnum), ntohl(packetPtr->tcp.acknum),
               winSize ));
 
@@ -1352,21 +1381,36 @@ void near TcpSocket::sendResetPacket( IpHeader *ip, TcpHeader *tcp, uint16_t inc
   rp.eh.setSrc( MyEthAddr );
   rp.eh.setType( 0x0800 );
 
+
+  // If we don't have this in our ARP table right now the reset packet won't
+  // be sent.  But we will fire off an ARP request and hopefully be ready if
+  // they try again.  (It's not worth the extra logic to keep track of reset
+  // packets that are pending ARP to resend them.)
+
   int8_t pendingArp = rp.ip.setDestEth( rp.eh.dest );
   if ( pendingArp == 0 ) {
     Packet_send_pkt( &rp, sizeof(TcpPacket_t) );
   }
 
+  TRACE_TCP(( "Tcp: Sent reset to (%d.%d.%d.%d:%u)\n",
+              ip->ip_src[0], ip->ip_src[1], ip->ip_src[2], ip->ip_src[3], tcp->src ));
 }
 
 
 
-// TcpSocket::sendPureAck
+// TcpSocket::sendImmediateAck
 //
 // Every once in a while we need to blast an empty packet out without queuing
 // it.  When we do that we want to make sure that only the ACK flag is set in
 // the packet.  We might also want to fudge the sequence number to elicit a
 // response from the other side.
+//
+// The reason for not queuing it is we want the SEQ and ACK numbers to match
+// the current state of the socket as it is now.  There may be queued packets
+// waiting to go out, but they have not been processed yet so they have not
+// altered SEQ or ACK.  If we queued this packet then we'd have to process
+// those other outgoing packets first, kind of defeating the purpose of sending
+// this packet.
 //
 // This function handles the setup of such a packet.  This is slightly
 // dangerous because this packet is allocated on the stack.  We need to ensure
@@ -1384,20 +1428,20 @@ void near TcpSocket::sendResetPacket( IpHeader *ip, TcpHeader *tcp, uint16_t inc
 // bit, so calling sendPacket would cause a FIN bit to go out,
 // not just the required ack.  setForceAckOnly takes care of that for us.
 
-void near TcpSocket::sendPureAck( bool forceProbe ) {
+void near TcpSocket::sendImmediateAck( bool forceProbe ) {
 
-  TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Sending %s\n",
-                   this,
-                   dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                   ( forceProbe ? "probe" : "empty ack") ));
+  TRACE_TCP_WARN(( "Tcp: (%p) (%s) Sending %s\n",
+                   this, connStr, ( forceProbe ? "probe" : "empty ack") ));
 
   if ( state != TCP_STATE_ESTABLISHED ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Badness: tried to sendPureAck in non-EST state\n", this ));
+    TRACE_TCP_WARN(( "Tcp: (%p) Badness: tried to sendImmediateAck in non-EST state\n", this ));
     return;
   }
 
   // Allocated on the stack: make sure this does not get queued up
   // anywhere, or we will have a dangling pointer into the stack.
+  // sendPacket will either put it on the wire or do nothing because
+  // it is pending ARP resolution.
 
   TcpBuffer ackPacket;
 
@@ -1409,6 +1453,7 @@ void near TcpSocket::sendPureAck( bool forceProbe ) {
   ackPacket.rc = 0;
 
   ackPacket.setForceAckOnly( );
+
   if ( forceProbe ) {
     ackPacket.setForceProbe( );
     Tcp::SentZeroWindowProbe++;
@@ -1477,7 +1522,7 @@ void Tcp::process( uint8_t *packet, IpHeader *ip ) {
   TcpSocket *owningSocket = NULL;
 
 
-  for ( uint8_t i=0; i < TcpSocketMgr::getActiveSockets( ); i++ ) {
+  for ( int i=0; i < TcpSocketMgr::getActiveSockets( ); i++ ) {
 
     TcpSocket *tmp = TcpSocketMgr::socketTable[i];
 
@@ -1507,7 +1552,7 @@ void Tcp::process( uint8_t *packet, IpHeader *ip ) {
   #ifdef TCP_LISTEN_CODE
   if ( owningSocket == NULL ) {
 
-    for ( uint8_t i=0; i < TcpSocketMgr::getActiveSockets( ); i++ ) {
+    for ( int i=0; i < TcpSocketMgr::getActiveSockets( ); i++ ) {
       TcpSocket *tmp = TcpSocketMgr::socketTable[i];
       if ( tmp->state == TCP_STATE_LISTEN ) {
         if ( tcpDstPort == tmp->srcPort ) {
@@ -1575,7 +1620,7 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
     if ( isSynSet ) bits[4]='S';
     if ( isFinSet ) bits[5]='F';
 
-    Trace_tprintf( "Tcp: (%08lx) Src: %d.%d.%d.%d:%u  Dst: %u  Payload Len: %d\n",
+    Trace_tprintf( "Tcp: (%p) Src: %d.%d.%d.%d:%u  Dst: %u  Payload Len: %d\n",
                    socket,
                    ip->ip_src[0], ip->ip_src[1], ip->ip_src[2], ip->ip_src[3],
                    ntohs( tcp->src ), ntohs( tcp->dst ), incomingDataLen );
@@ -1649,11 +1694,18 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
         }
         else { // !isAckSet
 
-          TRACE_TCP(( "     Simultaneous active opens; going to SYN_RECVED\n" ));
+          TRACE_TCP(( "     Simultaneous active opens\n" ));
 
           // Each side is doing active opens
           //
           // Our original SYN (pun intended) has not been ACKed yet.
+          // This is not the correct way to handle this, but this is a rare
+          // event and it's not worth coding it correctly.  Pretend we never
+          // sent our SYN, and resend it this time but ACK their SYN too.
+          // That will make it look like the normal three way handshake.
+          //
+          // It is possible the other side will get confused, but highly
+          // unlikely.
 
           socket->state = TCP_STATE_SYN_RECVED;
           socket->ackNum = incomingSeqNum + 1;
@@ -1686,10 +1738,12 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
 
   else {
 
-    // From this point forward the incoming seqNum has to match
-    // what we are expecting.  If it is old, it is a dupe and
-    // it should be ignored.  If it is newer than we expect there
-    // was a lost packet and they will retransmit eventually.
+    // From this point forward the incoming ACK number has to be within the
+    // range of our oldest un-ACKed SEQ number and our current SEQ number.
+    //
+    // If we get something older than our oldest un-ACKed SEQ number, then
+    // that is a duplicate packet to be ignored.  We should never get something
+    // newer than our current SEQ number, as we never sent that.
 
     uint8_t isIncomingAckProper = 0;
     if ( isAckSet ) {
@@ -1713,14 +1767,8 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
     }
 
 
-
+    // Check their incoming SEQ number against what we expect it to be.  
     uint8_t isIncomingSeqProper = (incomingSeqNum == socket->ackNum);
-
-    if ( socket->state == TCP_STATE_SYN_RECVED ) {
-      if ( incomingSeqNum == socket->ackNum || (incomingSeqNum == socket->ackNum-1) ) {
-        isIncomingSeqProper = 1;
-      }
-    }
 
 
     if ( isRstSet ) {
@@ -1739,12 +1787,8 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
       if ( isIncomingSeqProper ) {
 
         // They hit dead on.
-        TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Socket received reset in state: %s\n",
-                         socket,
-                         socket->dstHost[0], socket->dstHost[1],
-                         socket->dstHost[2], socket->dstHost[3],
-                         socket->dstPort, socket->srcPort,
-                         TcpSocket::StateDesc[socket->state] ));
+        TRACE_TCP_WARN(( "Tcp: (%p) (%s) Socket received reset in state: %s\n",
+                         socket, socket->connStr, TcpSocket::StateDesc[socket->state] ));
 
         // Page 37: If is in SYN_RECVED and was in LISTEN prior, go back
         // to LISTEN.  Otherwise, go to closed.
@@ -1806,8 +1850,10 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
 
 
       // Process data first before possible state changes.  If we get into
-      // buffer space trouble we can 'forget' that we saw this packet and
-      // play dead, hoping that the other side will retransmit.
+      // buffer space trouble we can forget that we saw this packet and
+      // not send an ACK, hoping that the higher level application processes
+      // some recevied bytes and frees up some space before the other side
+      // retransmits.
 
       if ( incomingDataLen ) {
 
@@ -1817,24 +1863,27 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
 
         if ( (rc & 0x2) == 0 ) {
 
-          // Data was added to the user incoming queue or receive buffer.
-          // We need to generate an outgoing ACK packet.
+          // Data was successfully copied for the application layer.  Generate
+          // an outgoing ACK packet if necessary.  (If there is an outgoing
+          // packet in the queue it will ACK this data when it gets sent.
 
           if ( socket->outgoing.entries == 0 ) {
-            // Nothing else to piggyback on, so generate one
             generatePkt = 1;
           }
+
         }
         else {
-          // They want us to play dead!
 
+          // There was no room to pass the incoming data to the application
+          // layer.  Throw this packet away without ACKing it, and hope
+          // they retransmit after we have some spaced cleared up.
+          //
           // This is ugly; I prefer to fall through, but in this case an
           // early exit is warranted.
 
-          // We are not generating an ACK packet, and we are not preserving
-          // this incoming packet.  Just free it and let them retransmitt.
           Buffer_free( packet );
           return;
+
         }
 
       }
@@ -1957,7 +2006,7 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
 
       // Error path.
       //
-      // If the incoming SEQ number doesn't match our ack number then
+      // If the incoming SEQ number doesn't match our ACK number then
       // a packet has been lost in transit to us.  We won't process this
       // packet and instead we'll send them an empty packet to tell
       // them the sequence number we expect.  They will also eventually
@@ -1966,8 +2015,13 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
       // If the incoming ACK number doesn't match our SEQ number then one
       // of the packets we sent got lost or is still in transit.  The
       // retransmit timer will take care of it.
+      //
+      // Use sendImmediateAck instead setting generatePkt because we don't
+      // want to wait to process any currently enqueued packets before
+      // getting this one out.  (We want to start the retrain process
+      // immediately.)
 
-      socket->sendPureAck( );
+      socket->sendImmediateAck( false );
       Tcp::Packets_SeqOrAckError++;
 
       // Whoops - sequence error.  If we have had too many then restrict
@@ -1978,12 +2032,7 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
 
       if ( socket->consecutiveSeqErrs > 4 ) {
         socket->reportSmallWindow = true;
-        TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Restricting window size\n",
-                         socket,
-                         socket->dstHost[0], socket->dstHost[1],
-                         socket->dstHost[2], socket->dstHost[3],
-                         socket->dstPort, socket->srcPort ));
-
+        TRACE_TCP_WARN(( "Tcp: (%p) (%s) Restricting window size\n", socket, socket->connStr ));
       }
 
     }
@@ -2009,16 +2058,21 @@ void near Tcp::process2( uint8_t *packet, IpHeader *ip, TcpHeader *tcp, TcpSocke
 }
 
 
-
-// Return code is ugly.  Bit 0 is 'free the incoming packet'.  Bit 1 is
-// 'play dead'.  If we don't play dead we want to generate an outgoing
-// ACK packet because we need to acknowledge the data that they sent.
-// But if we do need to play dead, then make sure nothing gets generated.
+// processPacketData
+//
+// Handles the data portion of the packet.  Either copy the data to our TCP
+// receive buffer, or let the user examine the packet directly.
+//
+// The return code has two pieces of information:
+//
+// bit 0 - tell the caller they should free the incoming packet.
+// bit 1 - tell the caller not to send an ACK for this packet.  This happens
+//         when we have to drop the data because there is no incoming space.
 
 int Tcp::processPacketData( TcpSocket *socket, uint16_t incomingDataLen, uint8_t *packet, IpHeader *ip, TcpHeader *tcp ) {
 
   uint8_t freePacket = 1;
-  uint8_t playDead = 0;
+  uint8_t suppressAck = 0;
 
 
   if ( socket->disableReads ) {
@@ -2029,13 +2083,8 @@ int Tcp::processPacketData( TcpSocket *socket, uint16_t incomingDataLen, uint8_t
 
     socket->ackNum += incomingDataLen;
 
-    TRACE_TCP(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) State: %s SHUT_RD set, tossing incoming data len %u\n",
-                socket,
-                socket->dstHost[0], socket->dstHost[1],
-                socket->dstHost[2], socket->dstHost[3],
-                socket->dstPort, socket->srcPort,
-                TcpSocket::StateDesc[socket->state],
-                incomingDataLen ));
+    TRACE_TCP(( "Tcp: (%p) (%s) State: %s SHUT_RD set, tossing incoming data len %u\n",
+                socket, socket->connStr, TcpSocket::StateDesc[socket->state], incomingDataLen ));
 
   } else {
 
@@ -2076,14 +2125,10 @@ int Tcp::processPacketData( TcpSocket *socket, uint16_t incomingDataLen, uint8_t
 
       }
       else {
-        TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) State: %s Dropped pkt: no space in ring buf\n",
-                         socket,
-                         socket->dstHost[0], socket->dstHost[1],
-                         socket->dstHost[2], socket->dstHost[3],
-                         socket->dstPort, socket->srcPort,
-                         TcpSocket::StateDesc[socket->state] ));
+        TRACE_TCP_WARN(( "Tcp: (%p) (%s) State: %s Dropped pkt: no space in ring buf\n",
+                         socket, socket->connStr, TcpSocket::StateDesc[socket->state] ));
         Packets_DroppedNoSpace++;
-        playDead = 1;
+        suppressAck = 1;
       }
 
     }
@@ -2098,15 +2143,11 @@ int Tcp::processPacketData( TcpSocket *socket, uint16_t incomingDataLen, uint8_t
         socket->ackNum += incomingDataLen;
       }
       else {
-        TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) State: %s Dropped pkt: recvBuffer full\n",
-                         socket,
-                         socket->dstHost[0], socket->dstHost[1],
-                         socket->dstHost[2], socket->dstHost[3],
-                         socket->dstPort, socket->srcPort,
-                         TcpSocket::StateDesc[socket->state] ));
+        TRACE_TCP_WARN(( "Tcp: (%p) (%s) State: %s Dropped pkt: recvBuffer full\n",
+                         socket, socket->connStr, TcpSocket::StateDesc[socket->state] ));
 
         Packets_DroppedNoSpace++;
-        playDead = 1;
+        suppressAck = 1;
       }
 
     }
@@ -2114,7 +2155,7 @@ int Tcp::processPacketData( TcpSocket *socket, uint16_t incomingDataLen, uint8_t
   } // end if reads disabled
 
 
-  return ( freePacket | (playDead<<1) );
+  return ( freePacket | (suppressAck<<1) );
 }
 
 
@@ -2135,21 +2176,26 @@ void near TcpSocket::processSyn( IpHeader *ip, TcpHeader *tcp, uint32_t incoming
   // Allocate a new socket to use.
   TcpSocket *newSocket = TcpSocketMgr::getSocket( );
   if ( newSocket == NULL ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Could not allocate socket for incoming SYN\n", this ));
+    TRACE_TCP_WARN(( "Tcp: (%p) Could not allocate socket for incoming SYN\n", this ));
     return;
   }
 
-  // Allocate a recvBuffer.  The recvBuffer size comes from whatever
+  // Allocate a recvBuffer if needed.  The recvBuffer size comes from whatever
   // the listening socket has it set for.
-  int8_t rc = newSocket->setRecvBuffer( this->rcvBufSize );
-  if ( rc ) {
-    // Dang again.
-    newSocket->destroy( );
-    // Setting close reason here, but they'll never see this socket.
-    newSocket->closeReason = 3;
-    TcpSocketMgr::freeSocket( newSocket );
-    TRACE_TCP_WARN(( "Tcp: (%08lx) Failed to alloc recv buf on new socket\n", this ));
-    return;
+
+  if ( this->rcvBufSize ) {
+
+    int8_t rc = newSocket->setRecvBuffer( this->rcvBufSize );
+    if ( rc ) {
+      // Dang again.
+      newSocket->destroy( );
+      // Setting close reason here, but they'll never see this socket.
+      newSocket->closeReason = 3;
+      TcpSocketMgr::freeSocket( newSocket );
+      TRACE_TCP_WARN(( "Tcp: (%p) Failed to alloc recv buf on new socket\n", this ));
+      return;
+    }
+
   }
 
 
@@ -2164,15 +2210,19 @@ void near TcpSocket::processSyn( IpHeader *ip, TcpHeader *tcp, uint32_t incoming
   Ip::copy( newSocket->dstHost, ip->ip_src );
   newSocket->dstPort = ntohs( tcp->src );
 
+  #ifndef NOTRACE
+  sprintf( newSocket->connStr, "%u.%u.%u.%u:%u %u",
+           newSocket->dstHost[0], newSocket->dstHost[1],
+           newSocket->dstHost[2], newSocket->dstHost[3],
+           newSocket->dstPort, newSocket->srcPort );
+  #endif
+
   newSocket->state = TCP_STATE_SYN_RECVED;
   newSocket->ackNum = incomingSeqNum + 1;
 
   newSocket->setMaxEnqueueSize( tcp );
 
-  TRACE_TCP(( "Tcp: (%08lx) New socket for %d.%d.%d.%d:%u, local port: %u\n",
-              newSocket, newSocket->dstHost[0], newSocket->dstHost[1],
-              newSocket->dstHost[2], newSocket->dstHost[3], newSocket->dstPort,
-              newSocket->srcPort ));
+  TRACE_TCP(( "Tcp: (%p) (%s) New socket\n", newSocket, newSocket->connStr ));
 
   newSocket->connectPacket.pkt.dataLen = 0;
 
@@ -2201,8 +2251,8 @@ void near TcpSocket::processSyn( IpHeader *ip, TcpHeader *tcp, uint32_t incoming
 
 void near TcpSocket::removeSentPackets( uint32_t targetSeqNum ) {
 
-  TRACE_TCP(( "Tcp: (%08lx) Removing sent pkts w/ seqnum < %08lx (%d in queue)\n",
-          this, targetSeqNum, sent.entries ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Removing sent pkts w/ seqnum < %08lx (%d in queue)\n",
+          this, connStr, targetSeqNum, sent.entries ));
 
   while (1) {
 
@@ -2261,7 +2311,7 @@ void near TcpSocket::removeSentPackets( uint32_t targetSeqNum ) {
 
         if ( SRTT == 0 ) SRTT = 1; else if ( SRTT > TCP_MAX_SRTT ) SRTT = TCP_MAX_SRTT;
 
-        TRACE_TCP(( "RTT Stats: (%08lx) RTT: %5u   newSRTT: %5u    Dev: %5u\n", this, RTT, SRTT, RTT_deviation ));
+        TRACE_TCP(( "     RTT Stats: RTT: %u, newSRTT: %u, Dev: %u\n", RTT, SRTT, RTT_deviation ));
       }
 
       TRACE_TCP(( "     Removing pkt with seq num + len %08lx, len %u\n", p->seqNum, p->dataLen));
@@ -2292,8 +2342,8 @@ int8_t near TcpSocket::addToRcvBuf( uint8_t *data, uint16_t dataLen ) {
     return TCP_RC_BAD;
   }
 
-  TRACE_TCP(( "Tcp: (%08lx) Add: RcvBufEntries=%u, Adding %u\n",
-          this, rcvBufEntries, dataLen ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Add: RcvBufEntries=%u, Adding %u\n",
+          this, connStr, rcvBufEntries, dataLen ));
 
   rcvBufEntries += dataLen;
 
@@ -2356,10 +2406,8 @@ int16_t TcpSocket::recv( uint8_t *userBuf, uint16_t userBufLen ) {
 
   if ( state < TCP_STATE_ESTABLISHED ) {
 
-    TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Tried recv in state %s\n",
-                     this,
-                     dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                     TcpSocket::StateDesc[state] ));
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Tried recv in state %s\n",
+                     this, connStr, TcpSocket::StateDesc[state] ));
     return TCP_RC_RECV_BAD_STATE;
   }
 
@@ -2371,8 +2419,8 @@ int16_t TcpSocket::recv( uint8_t *userBuf, uint16_t userBufLen ) {
     cpyLen = rcvBufEntries;
   }
 
-  TRACE_TCP(( "Tcp: (%08lx) Recv: RcvBufEntries=%u, removing %u\n",
-          this, rcvBufEntries, cpyLen ));
+  TRACE_TCP(( "Tcp: (%p) (%s) Recv: RcvBufEntries=%u, removing %u\n",
+          this, connStr, rcvBufEntries, cpyLen ));
 
 
   rcvBufEntries -= cpyLen;
@@ -2396,8 +2444,25 @@ int16_t TcpSocket::recv( uint8_t *userBuf, uint16_t userBufLen ) {
   // business again.
 
   if ( origWin == 0 ) {
-    sendPureAck( );
+
+    sendImmediateAck( false );
     Tcp::OurWindowReopened++;
+
+  } else {
+
+    // If we processed data ensure there is a new outgoing ACK that opens up the window.
+    //
+    // This can get chatty if the caller processes a small amount of data on each recv
+    // call.  We can prevent that by combining outgoing ACKs, which the code will do.
+    // But if they use a pattern where they read a small number of bytes, then drive
+    // outgoing packets, they will keep sending ACKS every time they read data.  If that
+    // gets too chatty, read more data before driving outgoing packets.
+
+    if ( outgoing.entries == 0 ) {
+      connectPacket.pkt.dataLen = 0;
+      enqueue( &connectPacket.pkt );
+    }
+
   }
 
   return cpyLen;
@@ -2421,11 +2486,11 @@ int16_t TcpSocket::recv( uint8_t *userBuf, uint16_t userBufLen ) {
 
 int16_t TcpSocket::send( uint8_t *userBuf, uint16_t userBufLen ) {
 
+  TRACE_TCP(( "Tcp: (%p) (%s) Send %u bytes, buf: %p\n", this, connStr, userBufLen, userBuf ));
+
   if ( state != TCP_STATE_ESTABLISHED ) {
-    TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) Tried to send a packet while in %s\n",
-                     this,
-                     dstHost[0], dstHost[1], dstHost[2], dstHost[3], dstPort, srcPort,
-                     TcpSocket::StateDesc[state] ));
+    TRACE_TCP_WARN(( "Tcp: (%p) (%s) Tried to send a packet while in %s\n",
+                     this, connStr, TcpSocket::StateDesc[state] ));
     return TCP_RC_BAD;
   }
 
@@ -2458,6 +2523,8 @@ int16_t TcpSocket::send( uint8_t *userBuf, uint16_t userBufLen ) {
     bytesSent += cpyLen;
   }
 
+  TRACE_TCP(( "Tcp: (%p) (%s) Enqueued %u bytes for send\n", this, connStr, bytesSent ));
+
   return bytesSent;
 }
 
@@ -2485,11 +2552,8 @@ void Tcp::drivePackets2( void ) {
 
         if ( sentPacket->attempts > TCP_RETRANS_COUNT ) {
 
-          TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) State: %s Too many retries (%u) on packet (SEQ=%08lx, ACK=%08lx)\n",
-                           socket,
-                           socket->dstHost[0], socket->dstHost[1],
-                           socket->dstHost[2], socket->dstHost[3],
-                           socket->dstPort, socket->srcPort,
+          TRACE_TCP_WARN(( "Tcp: (%p) (%s) State: %s Too many retries (%u) on packet (SEQ=%08lx, ACK=%08lx)\n",
+                           socket, socket->connStr, 
                            TcpSocket::StateDesc[socket->state],
                            sentPacket->attempts,
                            ntohl(sentPacket->headers.tcp.seqnum),
@@ -2529,11 +2593,8 @@ void Tcp::drivePackets2( void ) {
 
         Packets_Retransmitted++;
 
-        TRACE_TCP_WARN(( "Tcp: (%08lx) (%d.%d.%d.%d:%u %u) State: %s Retrans: Tries: %u  SEQ=%08lx  ACK=%08lx  SRTT (%u, %u)\n",
-                         socket,
-                         socket->dstHost[0], socket->dstHost[1],
-                         socket->dstHost[2], socket->dstHost[3],
-                         socket->dstPort, socket->srcPort,
+        TRACE_TCP_WARN(( "Tcp: (%p) (%s) State: %s, Retrans: Tries: %u, SEQ=%08lx, ACK=%08lx, SRTT (%u, %u)\n",
+                         socket, socket->connStr,
                          TcpSocket::StateDesc[socket->state],
                          sentPacket->attempts,
                          ntohl(sentPacket->headers.tcp.seqnum),
@@ -2576,7 +2637,7 @@ void Tcp::drivePackets2( void ) {
 
         if ( elapsedTicks > TIMER_MS_TO_TICKS(TCP_PROBE_INTERVAL) ) {
           socket->lastAckRcvd = currentTicks;
-          socket->sendPureAck( true );
+          socket->sendImmediateAck( true );
         }
 
         // Whether we sent a probe or not, don't send any more data.

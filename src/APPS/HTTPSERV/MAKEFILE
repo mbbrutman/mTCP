@@ -1,0 +1,99 @@
+#
+# HttpServ makefile
+#
+#
+# Possible optimizations for 8088 class processors
+#
+# -oa   Relax alias checking
+# -ob   Try to generate straight line code
+# -oe - expand user functions inline (-oe=20 is default, adds lots of code)
+# -oh   Enable repeated optimizations
+# -oi   generate certain lib funcs inline
+# -oi+  Set max inline depth (C++ only, use -oi for C)
+# -ok   Flowing of register save into function flow graph
+# -ol   loop optimizations
+# -ol+  loop optimizations plus unrolling
+# -or   Reorder for pipelined (486+ procs); not sure if good to use
+# -os   Favor space over time
+# -ot   Favor time over space
+# -ei   Allocate an "int" for all enum types
+# -zp2  Allow compiler to add padding to structs
+# -zpw  Use with above; make sure you are warning free!
+# -0    8088/8086 class code generation
+# -s    disable stack overflow checking
+# -zmf  put each function in a new code segment; helps with linking
+
+tcp_h_dir = ..\..\TCPINC\
+tcp_c_dir = ..\..\TCPLIB\
+common_h_dir = ..\..\INCLUDE
+
+memory_model = -ml
+compile_options = -0 $(memory_model) -DCFG_H="httpserv.cfg" -oa -ob -oh -oi -ok -ol -os -ei -zp2 -zpw -we -s
+compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
+
+
+# Flag for SNTP client.  This adds new object files so it can't be done as a -D.
+USE_SNTP = true
+
+
+# Defines for other optional features that don't add more object files:
+# 
+# -DKEYBOARD_COMMANDS     - enable entering commands at the keyboard. (experimental)
+
+# extra_opts=-DKEYBOARD_COMMANDS
+
+
+
+tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj utils.obj timer.obj ipasm.obj trace.obj udp.obj
+objs = httpserv.obj client.obj screen.obj dircache.obj fcache.obj
+
+!ifdef USE_SNTP
+extra_opts += -DSNTP_CLIENT
+tcpobjs += dns.obj sntplib.obj
+!endif
+
+
+
+all : clean httpserv.exe httpserv_bios_screen_writes.exe
+
+install : .symbolic
+	@copy httpserv.exe ..\..\execs
+	@copy httpserv_bios_screen_writes.exe ..\..\execs_extra
+
+clean : .symbolic
+  @del *.exe
+  @del *.obj
+  @del *.map
+
+patch : .symbolic
+  ..\..\utils\ptach httpserv.exe httpserv.map $(memory_model)
+  ..\..\utils\ptach httpserv_bios_screen_writes.exe httpserv_bios_screen_writes.map $(memory_model)
+
+.asm : $(tcp_c_dir)
+
+.cpp : $(tcp_c_dir)
+
+.asm.obj :
+	wasm -0 $(memory_model) $[*
+
+.cpp.obj :
+	wpp $[* $(compile_options) $(extra_opts) $(bios_write_opt)
+
+
+httpserv.exe: $(tcpobjs) $(objs)
+  wlink system dos option map option eliminate option stack=4096 name $@ file *.obj
+
+
+# This version uses the BIOS to do screen writes instead of direct screen writes.
+# This is the easiest way to change extra_opts, but it requires a fake target.
+
+httpserv_bios_screen_writes.exe : .symbolic
+	@del *.obj
+	wmake bios_write_opt="-DBIOS_SCREEN_WRITES" httpserv_bios_screen_writes_.exe
+	@del httpserv_bios_screen_writes.*
+	@rename httpserv_bios_screen_writes_.exe httpserv_bios_screen_writes.exe
+	@rename httpserv_bios_screen_writes_.map httpserv_bios_screen_writes.map
+
+httpserv_bios_screen_writes_.exe: $(tcpobjs) $(objs)
+  wlink system dos option map option eliminate option stack=4096 name $@ file *.obj
+

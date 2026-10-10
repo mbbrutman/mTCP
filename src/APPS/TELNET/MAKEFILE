@@ -47,6 +47,9 @@ objs = telnet.obj telnetsc.obj keys.obj ymodem.obj $(extra_objs)
 
 all : clean telnet.exe
 
+install : .symbolic
+	@copy telnet.exe ..\..\execs
+
 clean : .symbolic
   @del telnet.exe
   @del *.obj

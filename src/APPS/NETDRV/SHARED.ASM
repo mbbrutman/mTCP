@@ -1,5 +1,5 @@
 ; mTCP NetDrive (SHARED.ASM)
-; Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+; Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
 ; mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 ;
 ;
@@ -22,6 +22,20 @@
 
 
 
+; Versions
+;
+; This version number is between the device driver and command line utility
+; and is needed to ensure both sides are looking at the same shared data
+; structures.
+;
+; 01 - Initial version (Nov 2023)
+; 02 - Add support for multiple drive letters. (Feb 2024)
+; 03 - Added a field for the simulated packet driver software interrupt. (Sept 2024)
+; 04 - Further read-ahead work: Add an MTU, etc.
+
+SHARED_DATA_VERSION equ         4
+
+
 ; Network control data structure and per-unit data.  These are shared with
 ; the command line tool and need to stay synchronized with it.
 
@@ -34,8 +48,11 @@ unit_next_hop_mac   db          6 dup(?)        ; Next hop to get to this server
 unit_session        dw          ?               ; Session number (assigned by server)
 unit_sequence       dw          ?               ; UDP packet sequence number
 unit_remote_name    db          40 dup(?)       ; Null terminated remote drive name
-unit_bpb            db          size bpb dup(?) ; Drive parameter block for this unit.
-                    db          ?               ; padding
+unit_bpb            db          size bpb dup(?) ; Drive parameter block for this unit
+unit_max_readahead  db          0               ; Max read-ahead desired in blocks
+unit_ra_delay       db          0               ; Desired Delay time in millisconds between RA blocks
+unit_max_write_size db          0               ; Max write size in blocks
+                    dw          ?
 unit_blocks_read    dd          ?
 unit_blocks_written dd          ?
 unit_blocks_retries dd          ?
@@ -60,13 +77,18 @@ net_pkt_drv_hndl   dw          ?               ; Packet driver handle
 net_pkt_drv_int    db          ?               ; Packet driver software interrupt
 net_pkt_drv_int2   db          ?               ; Shim software interrupt
                    db          0
-net_pkt_recv_on    db          ?               ; Are we receiving packes
+net_pkt_recv_on    db          ?               ; Are we receiving packets
 net_pkt_timeout    dw          ?               ; Timeout threshold
 net_pkt_retries    dw          ?               ; How many attempts
 
+net_my_mtu         dw          ?               ; MTU for this network
 net_my_ip          db          4 dup(?)        ; My IP address
 net_my_port        dw          ?               ; My UDP port number
 net_my_mac         db          6 dup(?)        ; MAC address of this machine
+
+net_one_10th_ms    dw          ?               ; 8253 counter difference for 1/10 ms.
+net_user_send_dly  dw          0
+net_pkt_send_dly   dw          0
 
 net_c_r_total      dd          0               ; Total packets received
 net_c_r_our_mac    dd          0               ; Packets sent to our MAC address
@@ -74,8 +96,8 @@ net_c_r_our_udp    dd          0               ; UDP from our server sent to us
 net_c_s_arp_resp   dd          0               ; How many ARP responses have we sent?
 net_c_send_errs    dd          0               ; How many times did the packet driver refuse to send?
 
-net_arp_eye        db          8 dup(?)        ; Eye catcher
-net_arp_resp       db size pkt_arp dup(?)      ; Prebuilt ARP response
+net_arp_eye        db          "ARP RESP"      ; Eye catcher
+net_arp_resp       pkt_arp     <>              ; Prebuilt ARP response
 
 ifdef CHKSUM_TESTING
 test_IP            dd          ?

@@ -1,7 +1,7 @@
 /*
 
    mTCP Timer.H
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -34,7 +34,12 @@
 #ifndef TIMER_H
 #define TIMER_H
 
+#include CFG_H
 #include "types.h"
+
+#ifdef TIMER_8253_SUPPORT
+#include "inlines.h"
+#endif
 
 
 // Low resolution timer support
@@ -92,6 +97,8 @@ extern void Timer_stop( void );
 // Note: These timers are good to 60 minutes.  For anything longer than that
 // you are on your own.
 
+#define TIMER_MANAGED_SLOTS (10)
+
 #define Timer_SetCountdownTimerMs(a, b)   { a = ( b / TIMER_TICK_LEN ); }
 #define Timer_SetCountdownTimerSecs(a, b) { a = ( b * TIMER_TICKS_PER_SEC ); }
 #define Timer_SetCountdownTimerMins(a, b) { a = ( b * TIMER_TICKS_PER_MINUTE ); }
@@ -106,8 +113,48 @@ extern void Timer_stop( void );
 //
 // If you insist on using a timer that is a stack variable, call the
 // Timer_stopManagingTimer function before the variable goes out of scope.
+//
+// Adding an active timer again would be a bug.  But don't worry, we check
+// for that.
 
 void Timer_manageTimer( uint16_t *p );
+
 void Timer_stopManagingTimer( uint16_t *p );
+
+
+
+#ifdef TIMER_8253_SUPPORT
+
+// High resolution timer support
+//
+// Sometimes we need better resolution.  We can get that by reading the 8253
+// directly.
+//
+// The input to the 8253 timer is 1.193182 MHZ.
+//
+// In Mode 2 the reload counter is set to 65536.  Each count is worth 0.838 microseconds.
+// When the counter hits zero the interrupt is signaled and the counter gets reloaded.
+// This gives us the BIOS tick at just under 55ms.
+//
+// In Mode 3 the counter is also set to 65535.  The counter is decremented by two
+// so it has to be reloaded twice as fast, but the falling edge of the output is seen
+// half as often so the BIOS tick happens at the same time.  The difference is when you
+// read the counter; each counter change happens at the same 0.838 microseconds
+// but the counter value moves twice as fast.
+//
+// This constant assumes the machine is using 8253 timer mode 2.
+// If you find that you are actually in mode 3 then multiply these by two.
+
+#define TIMER_8253_ONE_MS (1193)
+
+#define TIMER_CH0_DATA_PORT (0x40)
+#define TIMER_CONTROL_PORT (0x43)
+
+
+int Timer_modeDetector( void );
+
+#endif
+
+
 
 #endif

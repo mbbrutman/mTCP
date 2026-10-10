@@ -1,7 +1,7 @@
 /*
 
    mTCP Irc.cpp
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -337,7 +337,7 @@ static char Msg_TopicChanged[] = "%s changed the topic on %s to %s\n";
 
 
 
-static char CopyrightMsg1[] = "mTCP IRCjr by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2025\n";
+static char CopyrightMsg1[] = "mTCP IRCjr by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2026\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -432,9 +432,7 @@ int main( int argc, char *argv[] ) {
   while ( !done ) {
     if ( checkUserWantsOut( ) ) break;
     if ( !Dns::isQueryPending( ) ) break;
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
     Dns::drivePendingQuery( );
 
   }
@@ -477,9 +475,7 @@ int main( int argc, char *argv[] ) {
 
     while ( 1 ) {
 
-      PACKET_PROCESS_SINGLE;
-      Tcp::drivePackets( );
-      Arp::driveArp( );
+      Utils::processPackets( );
 
       if ( s->isConnectComplete( ) ) { break; }
 
@@ -647,9 +643,7 @@ void sendMsg( uint8_t *buffer, uint16_t bufferLen ) {
     while ( bytesSent < bufferLen ) {
       int rc = s->send( (uint8_t *)buffer, bufferLen );
       if ( rc > 0 ) bytesSent += rc;
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-      Tcp::drivePackets( );
+      Utils::processPackets( );
     }
 
   } else {
@@ -683,9 +677,7 @@ void sendMsg( uint8_t *buffer, uint16_t bufferLen ) {
       while ( bytesSent < bufferLen ) {
         int rc = s->send( (uint8_t *)unicodeBuffer, outputIndex );
         if ( rc > 0 ) bytesSent += rc;
-        PACKET_PROCESS_SINGLE;
-        Arp::driveArp( );
-        Tcp::drivePackets( );
+        Utils::processPackets( );
       }
     }
 
@@ -697,9 +689,7 @@ void sendMsg( uint8_t *buffer, uint16_t bufferLen ) {
   while ( bytesSent < bufferLen ) {
     int rc = s->send( (uint8_t *)buffer, bufferLen );
     if ( rc > 0 ) bytesSent += rc;
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
   }
 
   #endif
@@ -1924,9 +1914,7 @@ void pollSocket( uint32_t timeout, uint16_t batching ) {
 
   while ( 1 ) {
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     int rc = s->recv( inBuf + inBufIndex, (INBUFSIZE - inBufIndex) );
     if ( rc > -1 ) inBufIndex += rc;

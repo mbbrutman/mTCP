@@ -1,7 +1,7 @@
 /*
 
    mTCP Netcat.cpp
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -230,7 +230,7 @@ void __interrupt __far ctrlCHandler( ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP Netcat by M Brutman (mbbrutman@gmail.com) (C)opyright 2007-2025\n";
+static char CopyrightMsg1[] = "mTCP Netcat by M Brutman (mbbrutman@gmail.com) (C)opyright 2007-2026\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -330,9 +330,7 @@ int main( int argc, char *argv[] ) {
 
       if ( !Dns::isQueryPending( ) ) break;
 
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-      Tcp::drivePackets( );
+      Utils::processPackets( );
       Dns::drivePendingQuery( );
 
     }
@@ -370,9 +368,7 @@ int main( int argc, char *argv[] ) {
         break;
       }
 
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-      Tcp::drivePackets( );
+      Utils::processPackets( );
 
       mySocket = TcpSocketMgr::accept( );
       if ( mySocket != NULL ) {
@@ -417,8 +413,7 @@ int main( int argc, char *argv[] ) {
 
   // By this point we have a connection ...
 
-  DosTime_t start;
-  gettime( &start );
+  clockTicks_t startTime = TIMER_GET_CURRENT( );
 
   int maxPacketSize = MyMTU - (sizeof(IpHeader) + sizeof(TcpHeader) );
 
@@ -459,9 +454,7 @@ int main( int argc, char *argv[] ) {
     }
 
     // Service the connection
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
 
     // Process incoming packets first.
@@ -704,7 +697,7 @@ int main( int argc, char *argv[] ) {
           if ( buf != NULL ) {
             buf->data[0] = tmpBuf[0];
             buf->data[1] = tmpBuf[1];
-            buf->b.dataLen = tmpBufLen;
+            buf->b.setDataLen( tmpBufLen );
 
             // Fixme: check return code
             mySocket->enqueue( &buf->b );
@@ -793,7 +786,7 @@ int main( int argc, char *argv[] ) {
         }
 
         TotalBytesSent += packetLen;
-        buf->b.dataLen = packetLen;
+        buf->b.setDataLen( packetLen );
 
         int16_t rc = mySocket->enqueue( &buf->b );
         if ( rc ) {
@@ -845,16 +838,13 @@ int main( int argc, char *argv[] ) {
   TcpSocketMgr::freeSocket( mySocket );
 
 
-  DosTime_t endTime;
-  gettime( &endTime );
-
-
   // Compute stats
 
-  uint16_t t = Utils::timeDiff( start, endTime );
+  uint32_t elapsedMs = uint32_t(TIMER_GET_CURRENT( ) - startTime) * 55;
+  uint32_t elapsedSecs = elapsedMs / 1000;
 
-  if ( Silent == 0 ) fprintf( stderr, "\nElapsed time: %u.%02u   Bytes sent: %ld  Received: %ld\n",
-                   (t/100), (t%100), TotalBytesSent, TotalBytesReceived );
+  if ( Silent == 0 ) fprintf( stderr, "\nElapsed time: %lu.%03lu   Bytes sent: %ld  Received: %ld\n",
+                   elapsedSecs, (elapsedMs%1000), TotalBytesSent, TotalBytesReceived );
 
   int8_t endRc = 0;
   if ( errorStop ) endRc = 4;

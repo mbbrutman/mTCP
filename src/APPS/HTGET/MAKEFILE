@@ -39,6 +39,9 @@ objs = htget.obj
 
 all : clean htget.exe
 
+install : .symbolic
+	@copy htget.exe ..\..\execs
+
 clean : .symbolic
   @del htget.exe
   @del *.obj

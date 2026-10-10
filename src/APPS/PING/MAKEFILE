@@ -38,6 +38,9 @@ objs = ping.obj
 
 all : clean ping.exe
 
+install : .symbolic
+	@copy ping.exe ..\..\execs
+
 clean : .symbolic
   @del ping.exe
   @del *.obj

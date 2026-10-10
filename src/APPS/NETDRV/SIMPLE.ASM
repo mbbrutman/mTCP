@@ -1,5 +1,5 @@
 ; mTCP NetDrive (SIMPLE.ASM)
-; Copyright (C) 2023-2025 Michael B. Brutman (mbbrutman@gmail.com)
+; Copyright (C) 2023-2026 Michael B. Brutman (mbbrutman@gmail.com)
 ; mTCP web page: http://www.brutman.com/mTCP/mTCP.html
 ;
 ;
@@ -26,6 +26,7 @@
 
 
 
+
 ; UDP Testing
 ;
 ; If you add -dCHKSUM_TESTING to the wasm command line in the makefile you will
@@ -47,6 +48,7 @@ include "RH.ASM"
 include "PKT.ASM"
 include "BPB.ASM"
 include "SHARED.ASM"
+include "SHIM.ASM"
 
 
 ; ============================================================================
@@ -75,8 +77,8 @@ rh_seg             dw          ?               ; request header segment
 ; This both an eye-catcher and our version number.  It must immediately
 ; preceed the shared data area or the EXE won't be able to find it.
 
-                   db          'NETDRIVE', 0x00, 0x03
-shared_data        db          size net_data dup(0)
+                   db          'NETDRIVE', 0x00, SHARED_DATA_VERSION
+shared_data        net_data    <>
 
                    even
                    db          'DEBUG   '
@@ -102,8 +104,21 @@ cmd_sectors_req    dw          ?               ; Sectors requested in the last U
 cmd_retry_count    dw          ?               ; Countdown retry for current packet
 cmd_resp_recved    db          0               ; Do we have a response yet?
 cmd_active         db          0               ; Are we even waiting for a response?
+cmd_output_crc_lcl dd          ?               ; CRC or checksum if we are doing write verify
+cmd_output_crc_rmt dd          ?               ; Received CRC or checksum from the server
 
 curr_unit          dw          ?               ; Offset to the current unit_data
+
+
+; Local variables used only during the output command.
+
+local_user_seg     dw         ?                ; Local copy of cmd_user_buf_seg.
+fragment_offset    dw         ?                ; Fragment offset of the next packet. (Multiples of 8 bytes)
+output_udp_len     dw         ?                ; Length of the entire UDP payload; sent in the UDP header.
+partial_chksum     dw         ?                ; NetDrive command and NetDrive payload checksum
+
+paras_to_send      dw         ?                ; Paragraphs (16 byte chunks) left to send.
+paras_this_pkt     dw         ?                ; Paragraphs going into the next outgoing packet.
 
 
 ; Misc networking stuff: IP and ARP housekeeping
@@ -115,6 +130,8 @@ sendAttempts       db          ?               ; How many attempts to make when 
                    db          'ARP DATA'
 arp_pending        db          0               ; Is there a pending ARP request to respond to?
                    db          0               ; Padding
+
+eth_broadcast      db          0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 
 
 ; Timer
@@ -128,12 +145,16 @@ arp_pending        db          0               ; Is there a pending ARP request 
 timerOrigInt       dd          ?               ; Original interrupt vector before we hooked it
 countdownTimer     dw          0               ; Use for detecting timeouts
 
+delayParm          dw          0               ; Parameter for the delay routine.
 
 ; Packet driver shim stuff
 
-theirReceiver      dd          0               ; Their receiver function
-dontShare          db          0               ; Are we passing this packet along?
-                   db          ?
+                   even
+                   db           "HANDLES "
+handles_in_use     dw 0                        ; How many handles are active.
+handle_found       dw ?                        ; Temp var used during handle searches.
+handles handle_rec MAX_HANDLES dup(<>)         ; The handle table.
+end_handles        label byte                  ; An easy way to detect when we past the table.
 
 
 
@@ -147,7 +168,7 @@ dontShare          db          0               ; Are we passing this packet alon
                    db          'STACKTIM'
 stack_ptr_timerint dw          ?
 stack_seg_timerint dw          ?
-                   db          127 dup ('X')
+                   db          255 dup ('X')
                    db          0
 stack_top_timerint equ         $-2
 
@@ -163,7 +184,7 @@ stack_top_recvint  equ         $-2
                    db          'STACKINT'
 stack_ptr_dosint   dw          ?
 stack_seg_dosint   dw          ?
-                   db          191 dup ('Z')
+                   db          255 dup ('Z')
                    db          0
 stack_top_dosint   equ         $-2
 
@@ -189,30 +210,29 @@ switchFromStack macro stackname:REQ
 endm
 
 
+; Packet buffers
+;
+; An incoming and outgoing packet buffer used to be statically allocated.
+; That was ok when the buffers were not large, but then the incoming
+; buffer had to grow to the full size to allow for the packet driver shim
+; code, and now the outgoing buffer also has to be full sized for streaming
+; writes.  So instead of burning the disk space for them by statically
+; allocating them, we now dynamically allocate them.
+
+                   even
+incoming_pkt_len   dw         ?
+incoming_buf_p     dw         ?
+outgoing_buf_p     dw         ?
+
+
 
 ; Tiny Ramdisk to use while a virtual drive is not connected.
 include "RAMDISK.ASM"
 
+include "READAH.ASM"
 
-
-; Packet buffers
-;
-; We need room for the Ethernet header (14), IP header (20), UDP header (8),
-; and a payload of up to 1KB.  Also leave room for IP options and some slop.
-;
-; Incoming is full sized because we might be passing packets to another
-; program.  Outgoing is probably oversized by 40 bytes but that is not
-; worth worrying about right now.
-
-ETH_BUF_RECV_SIZE  equ         1514
-
-                   even
-                   db          'INCOMING'
-incoming_buf       db          ETH_BUF_RECV_SIZE dup(?)
-                   db          'OUTGOING'
-outgoing_buf       db          1100 dup(?)
-                   db          'PKT_END '
-
+include "CRC.ASM"
+include "FLETCHER.ASM"
 
 
 
@@ -387,7 +407,7 @@ cmd_ioctl_input:
 
   ; If there are less than 8 bytes to write to fail the operation.
   cmp    es:[bx].rh_ioctl_count, 8
-  jge    cmd_ioctl_input1
+  jae    cmd_ioctl_input1
 
   ; Set a bad return code and leave.
   mov    es:[bx].rh_ioctl_count, 0
@@ -441,32 +461,63 @@ cmd_input:
   ; If the packet drive is not connected use the fake ram drive area
   mov    si, curr_unit
   cmp    [si].unit_session, 0
-  jnz    cmd_input_connected
+  jne    cmd_input_connected
 
-  ; Compute the starting byte to read:
-  mov    ax, es:[bx].rh_input_start      ; Start LBA
 
-  ; DOS 6.3 is being silly and using a 32 bit LBA for our 4 sector ram disk.
+  ; Reading from the RamDisk structure
+  ;
+  ; DOS is generally OK with the RamDisk having 64 byte sectors (which is
+  ; legal) but a lot of tools and other code assume 512 byte sectors.
+  ; We are going to be clever here and artifically inflate the RamDisk
+  ; sectors from 64 bytes to 512 bytes; everything we need is in the first
+  ; 64 bytes of a sector so we can generate zeros for the rest.
+
+  ; Get the starting LBA
+  mov    ax, es:[bx].rh_input_start
+
+  ; If this is later DOS being silly and using a 32 bit LBA for our four
+  ; sector RAM disk use the alternate location for the start LBA.
   cmp    ax, 0xffff
-  jnz    cmd_input_1
-
+  jne    cmd_input_1
   mov    ax, word ptr es:[bx].rh_input_hugeStart
 
   cmd_input_1:
-  mov    cl, 6                           ; Multiply by sector size
-  shl    ax, cl                          ; 
-  add    ax, OFFSET RamDisk
 
-  mov    dx, es:[bx].rh_input_count      ; Sectors ...
-  mov    cl, 5                           ; Multiply by 32 to get words
-  shl    dx, cl                          ; 
-  mov    cx, dx
+  ; AX has the starting sector now.
 
-  ; Using MOVSW so source is in DS:SI, target is in ES:DI
-  mov    si, ax
+  ; Get the sector count
+  mov    dx, es:[bx].rh_input_count
+
+  ; Set ES:DI up to point to their target buffer
   mov    di, es:[bx].rh_input_buf_off
   mov    es, es:[bx].rh_input_buf_seg
-  rep    movsw
+
+  cmd_input_ramdisk_loop_top:
+
+    push   ax
+
+    ; Compute an offset into the RamDisk structure
+    mov    cl, 6
+    shl    ax, cl
+    add    ax, OFFSET RamDisk
+
+    ; Copy 64 bytes using words.
+    ; Using MOVSW so source is in DS:SI, target is in ES:DI
+    mov    si, ax
+    mov    cx, 32
+    rep    movsw
+
+    ; Generate 448 bytes of zeros
+    mov    cx, 224
+    xor    ax, ax
+    rep    stosw
+
+    ; Get the sector number back
+    pop    ax
+
+    inc    ax
+    dec    dx
+    jnz    cmd_input_ramdisk_loop_top
 
   jmp    cmd_input_finished_good
 
@@ -485,11 +536,67 @@ cmd_input:
   ; Setup outgoing UDP command header
   ; These fields do not change even when reading multiple sectors.
 
-  mov    outgoing_buf.out_udp_start.pkt_nd_vers, 0x0001
+  mov    bx, outgoing_buf_p
+  mov    [bx].out_udp_start.pkt_nd_vers, ND_PROTOCOL_VERSION
   mov    si, curr_unit
   mov    ax, [si].unit_session
-  mov    outgoing_buf.out_udp_start.pkt_nd_session, ax
-  mov    outgoing_buf.out_udp_start.pkt_nd_op, Op_Read
+  mov    [bx].out_udp_start.pkt_nd_session, ax
+  mov    [bx].out_udp_start.pkt_nd_op, Op_Read
+
+  ; Clear out other fields in the header that won't be used.  Result doesn't
+  ; need to be cleared because the server is the only thing to set it, but
+  ; I'd rather see a 0 there in the packet traces.
+  mov    [bx].out_udp_start.pkt_nd_result, 0
+  mov    [bx].out_udp_start.pkt_nd_cmdext, 0
+  
+
+  ; This is a new read from our caller in DOS.  This invalidates
+  ; previously received read-ahead data because the user buffer or
+  ; drive they are reading may have changed.  (We could check for
+  ; both and if it is an exact re-read of the same LBAs from the save
+  ; drive keep our read-ahead data, but that is not likely.)
+  ;
+  ; This has to be done with interrupts disabled because we never know
+  ; when a packet might come in and start to be processed.
+
+  pushf
+  cli
+
+  ; Invalidate the read-ahead bitmap
+  mov    di, OFFSET ra_slot_valid
+  xor    ax, ax
+  stosw
+  stosw
+  stosw
+  stosw
+  stosw
+  stosw
+  stosw
+  stosw
+  stosw
+
+
+  ; Record the current sequence number.  This will be used to filter
+  ; out delayed or old read-ahead data.  SI still has curr_unit.
+  mov    ax, [si].unit_sequence
+  mov    ra_seq_start, ax
+
+  ; Save the most current LBA start and block count issued by DOS.
+  mov    ax, word ptr cmd_start
+  mov    word ptr ra_lba_start, ax
+  mov    ax, word ptr cmd_start+2 ; High 16 bits
+  mov    word ptr ra_lba_start+2, ax
+
+  mov    ax, cmd_count
+  mov    ra_lba_count, ax
+
+  ; Save the user buffer starting address.
+  mov    ax, cmd_user_buf_off    ; User buffer offset
+  mov    ra_buf_off, ax
+  mov    ax, cmd_user_buf_seg    ; User buffer segment
+  mov    ra_buf_seg, ax
+
+  popf
 
 
   ; Setup the loop to do multiple sectors.  Try to do two at a time
@@ -499,28 +606,146 @@ cmd_input:
   cmp    cmd_count, 0
   jz     cmd_input_finished_good
 
+
+
+  ; Check to see if this block already arrived.  If it did the bit that
+  ; represents the block will be on.
+
+  ; Disable interrupts to prevent new blocks being received from changing things
+  ; while we are looking at them.
+  pushf
+  cli
+
+
+  ; What bit in the readahead bitmap are we looking at?
+
+  ; These are 32 bit quantities but we never have a difference that can overflow
+  ; a 16 bit counter so ignore the upper word of the counters.
+  mov    ax, word ptr cmd_start
+  sub    ax, word ptr ra_lba_start
+
+  ; If AX comes up as zero this is the first sector which we issued a read for.
+  ; That's never going to be filled in on a read-ahead, so exclude it.
+
+  cmp    ax, 0
+  jz     cmd_input_not_in_cache
+
+  cmp    ax,RA_MAX_BLOCK
+  ja     cmd_input_not_in_cache
+
+  ; Figure out which byte of ra_slot_valid to get and load it into BL
+  mov    bx, ax
+  shr    bx, 1
+  shr    bx, 1
+  shr    bx, 1
+  add    bx, OFFSET ra_slot_valid
+  mov    bl, byte ptr [bx]
+  xor    bh, bh
+
+  ; Isolate the bit in AX
+  and    ax, 0x7
+  mov    cx, ax
+  mov    ax, 1
+  shl    ax, cl
+
+  test   bx, ax
+  jz     cmd_input_not_in_cache
+
+
+  ; Bump the start LBA, decrement the count and advance the target
+  ; buffer address.
+
+  add    word ptr cmd_start, 1           ; 32 bits so add with carry.
+  adc    word ptr cmd_start+2, 0         ; Capture the carry bit.
+  add    cmd_user_buf_seg, 0x20          ; Advance 512 bytes
+  dec    cmd_count                       ; Update the number of sectors left to do.
+
+  popf                                   ; Reenable interrupts
+  jmp    cmd_input_loop_top              ; And go back to do it all again ...
+  
+
+  cmd_input_not_in_cache:
+
+  popf                                   ; Reenable interrupts
+
+
+  cmd_input_send_req:
+
   mov    ax, shared_data.net_pkt_retries ; Reset the retry counter
   mov    cmd_retry_count, ax 
 
   cmd_input_loop_retry_top:
-  call   set_outgoing_ssc                ; Set outgoing Sequence, Start and Count
 
 
-  ; Fill in the Eth, IP, and UDP headers and send the packet.  DX needs to
-  ; contain the length of the UDP payload (not including the UDP header.)
+  ; Set outgoing Sequence, Start and Count in the outgoing packet.
+  ; Also make a note of how many blocks we are requesting in this
+  ; packet.
+
+  mov    bx, outgoing_buf_p
+  mov    si, curr_unit
+
+  mov    ax, [si].unit_sequence
+  mov    [bx].out_udp_start.pkt_nd_sequence, ax
+
+  mov    ax, word ptr cmd_start
+  mov    word ptr [bx].out_udp_start.pkt_nd_start, ax
+  mov    ax, word ptr cmd_start+2
+  mov    word ptr [bx].out_udp_start.pkt_nd_start+2, ax
+
+  mov    dx, 1                           ; Doing at least one
+  cmp    cmd_count, 1
+  jz     set_outgoing_ssc_just_one
+  inc    dx                              ; Doing two.
+
+  set_outgoing_ssc_just_one:
+  mov    cmd_sectors_req, dx
+  mov    [bx].out_udp_start.pkt_nd_count, dx
+
+
+  ; Get ready to set up the outgoing packet.
+  mov    dx, UDP_ND_LEN                  ; UDP header and fixed len command header.
+
+  
+  ; Set read-ahead in the outgoing packet payload.  Only set the blocks we
+  ; intend to read and not just blindly use the full readahead count.
+  ; Also bump the packet length to reflect this additional data.
+  ; BX is still set to outgoing_buf_p.
+
+  xor    ax, ax
+  mov    al, [si].unit_max_readahead     ; si is still pointing to curr_unit.
+  mov    word ptr [bx].out_udp_start.pkt_nd_data, ax
+  mov    ax, cmd_count
+  mov    word ptr [bx].out_udp_start.pkt_nd_data+2, ax
+  xor    ax, ax
+  mov    al, [si].unit_ra_delay
+  mov    word ptr [bx].out_udp_start.pkt_nd_data+4, ax
+  add    dx, 6                           ; Add six for the read-ahead optional data
+
+
+  ; Fill in the Eth, IP, and UDP headers and send the packet.
   ; After the packet has been sent, setup the countdown timer.
 
-  mov    dx, ND_Len                      ; Fixed len command header.
   mov    cmd_resp_recved, 0
-  call   sendUDP
+
+
+  ; Code to replace sendUDP
+  xor    bx, bx                          ; No need to call prepIpFlags
+  call   setEthIpHeaders                 ; DX has the UDP payload length for the IP header.
+  xor    ax, ax                          ; No partial checksum computed yet.
+  call   setUdpHeader                    ; Uses AX and DX
+  mov    cx, dx                          ; DX has the UDP payload length
+  add    cx, 0x22                        ; Add the Eth and IP headers
+  call   sendPacket
+
+
   mov    ax, shared_data.net_pkt_timeout
   mov    countdownTimer, ax
-
 
   cmd_input_spinwait:
   ; Now spin and wait for the response
   cmp    cmd_resp_recved, 1
   jz     cmd_input_check_result
+
   cmp    countdownTimer, 0
   jnz    cmd_input_spinwait
 
@@ -539,6 +764,7 @@ cmd_input:
 
 
   cmd_input_check_result:
+
   cmp    cmd_result, 0
   jnz    cmd_input_bad_result
 
@@ -636,21 +862,6 @@ cmd_output_common:
   mov    es, ax
 
 
-  ; Setup outoing UDP command header
-  ; These fields do not change even when reading multiple sectors.
-
-  mov    outgoing_buf.out_udp_start.pkt_nd_vers, 0x0001
-  mov    si, curr_unit
-  mov    ax, [si].unit_session
-  mov    outgoing_buf.out_udp_start.pkt_nd_session, ax
-  mov    al, cmd_op
-  mov    outgoing_buf.out_udp_start.pkt_nd_op, al
-
-
-
-  ; Setup the loop to do multiple sectors.  Try to do two at a time
-  ; until there are one or zero left.
-
   cmd_output_loop_top:
   cmp    cmd_count, 0
   jz     cmd_output_loop_finished
@@ -658,40 +869,317 @@ cmd_output_common:
   mov ax, shared_data.net_pkt_retries    ; Reset the retry counter
   mov cmd_retry_count, ax 
 
+
   cmd_output_loop_retry_top:
-  call set_outgoing_ssc                  ; Set outgoing Sequence, Start and Count
+
+  ; Setup the outgoing NetDrive command header and compute how many sectors
+  ; we will send in this group.
+
+  mov    si, curr_unit
+
+  mov    bx, outgoing_buf_p
+  mov    [bx].out_udp_start.pkt_nd_vers, ND_PROTOCOL_VERSION
+  mov    ax, [si].unit_session
+  mov    [bx].out_udp_start.pkt_nd_session, ax
+  mov    ax, [si].unit_sequence
+  mov    [bx].out_udp_start.pkt_nd_sequence, ax
+  mov    al, cmd_op
+  mov    [bx].out_udp_start.pkt_nd_op, al
+  mov    ax, word ptr cmd_start
+  mov    word ptr [bx].out_udp_start.pkt_nd_start, ax
+  mov    ax, word ptr cmd_start+2
+  mov    word ptr [bx].out_udp_start.pkt_nd_start+2, ax
+
+  ; Clear out other fields in the header that won't be used.  Result doesn't
+  ; need to be cleared because the server is the only thing to set it, but
+  ; I'd rather see a 0 there in the packet traces.
+  mov    [bx].out_udp_start.pkt_nd_result, 0
 
 
-  ; Copy the user data to the payload portion.
+  ; Figure out how many blocks we are going to send under this command.
+
+  xor    dx, dx
+  mov    dl, [si].unit_max_write_size
+  cmp    cmd_count, dx                       ; cmd_count is the remaining block count
+  jae    cmd_output_max_blocks
+  mov    dx, cmd_count
+  cmd_output_max_blocks:
+  ; Update the sectors requested for this iteration and also set it in the packet.
+  mov    cmd_sectors_req, dx
+  mov    [bx].out_udp_start.pkt_nd_count, dx
+
+
+  ; Set CRC algorithm in the cmdext field.  At 4KB and below we use CRC-CCITT 16
+  ; and above 4K we use Fletcher-32.
+  ;
+  ; We are being lazy here; this only needs one byte, and probably even only
+  ; one bit.  But treating it as a word will zero out the other byte for us.
+
+  xor    ax, ax                               ; Default: not a write verify.
+  cmp    cmd_op, Op_Write
+  je     cmd_output_cmdext_set
+  inc    ax                                   ; AX=1: CRC-CCITT 16 bit
+  cmp    dx, 9
+  jb     cmd_output_cmdext_set
+  inc    ax                                   ; AX=2: Fletcher-32
+  cmd_output_cmdext_set:
+  mov    [bx].out_udp_start.pkt_nd_cmdext, ax
+
+
+  ; Instead of counting sectors to send, let's count paragraphs (16 byte chunks)
+  ; to send.  That gets us close to perfectly filling packets without having to
+  ; mess with the offsets.
+  mov    cl, 5
+  shl    dx, cl
+  mov    paras_to_send, dx
+
+
+  ; Make a local copy of the user buffer segment.  This copy gets advanced as
+  ; we send fragments, while the original only advances after we are told the
+  ; write has completed.  (A copy of the offset is not needed, as the offset
+  ; is never modified so we can use cmd_user_buf_off.)
+  mov    ax, cmd_user_buf_seg
+  mov    local_user_seg, ax
+
+  mov    fragment_offset, 0
+
+
+  ; Figure out how many paragraphs of user data are going into the next packet.
+  ; Start with the MTU then subtract 20 for the IP header, 8 for the UDP header
+  ; and 16 for the NetDrive command header.
+  mov    dx, shared_data.net_my_mtu
+  sub    dx, (IP_HDR_LEN + UDP_ND_LEN)       ; Subtract 20 for IP header, 8 for UDP
+  shr    dx, 1                               ; Divide by 16
+  shr    dx, 1
+  shr    dx, 1
+  shr    dx, 1
+
+  ; DX has paragraphs available in the next packet.  Assume we are going to fill it.
+  mov    paras_this_pkt, dx
+  cmp    paras_to_send, dx
+  ja     cmd_output_pkt_paras_set
+  mov    dx, paras_to_send
+  mov    paras_this_pkt, dx
+  cmd_output_pkt_paras_set:
+
+
+  ; SW: Sending packets
+  ;
+  ; * Compute a partial checksum over the user data in the original user
+  ;   buffer, as we need this for the UDP header in the first packet.
+  ; * Send the first packet with the UDP header.
+  ;   * If everthing is going to fit, do not turn on the fragment flag.
+  ; * If there is more data, loop and send out the remaining data.
+
+
+  ; Compute a partial checksum for the command header and then the user data.
+
+  mov    cx, ND_LEN
+  lea    si, [bx].out_udp_start.pkt_nd_vers
+  xor    bx, bx
+  call   computeUdpDataChecksum
+
+  ; Now we have a partial checksum for the header in AX.  Do it for the user data now.
+
+  mov    dx, cmd_sectors_req             ; Given 512 byte blocks, compute number of bytes.
+  mov    dh, dl                          ; Fast shift to mult by 256.
+  xor    dl, dl                          ; Clear lower byte as part of the mult by 256.
+  shl    dx, 1                           ; One more shift to get to bytes.
+
+  mov    cx, dx
+  mov    si, cmd_user_buf_off
+  mov    ds, local_user_seg              ; Order is important here ... muck up DS last.
+  mov    bx, ax                          ; Pass in the partial checksum we computed earlier.
+  call   computeUdpDataChecksum
+
+  ; Save AX momentarily while we restore DS
+  push   ax
+  mov    ax, cs
+  mov    ds, ax
+  pop    ax
+
+  ; Save the partial checksum away for later
+  mov    partial_chksum, ax
+
+  ; Also save the UDP data length away for later.  Include the UDP and command header too.
+  mov    output_udp_len, dx
+  add    output_udp_len, UDP_ND_LEN
+
+
+
+  ; First packet: Copy user data to the UDP payload area.
   ; Using MOVSW so source is in DS:SI, target is in ES:DI
 
-  mov    di, OFFSET outgoing_buf.out_udp_start.pkt_nd_data
+  mov    cx, paras_this_pkt              ; Put the number of words in CX
+  shl    cx, 1
+  shl    cx, 1
+  shl    cx, 1
+
+  mov    dx, cx                          ; Set the number of bytes in DX
+  shl    dx, 1
+
+  mov    bx, outgoing_buf_p
+  lea    di, [bx].out_udp_start.pkt_nd_data
   mov    si, cmd_user_buf_off
-  mov    ds, cmd_user_buf_seg            ; Order is important here ... muck up ds last.
+  mov    ds, local_user_seg              ; Order is important here ... muck up DS last.
 
-  ; DX has number of sectors in it from above as a side effect of set_outgoing_ssc.
-  ; Convert to number of dwords.  (No need to check for an odd number of bytes here.)
-
-  mov    dh, dl                          ; Multiply by 256
-  xor    dl, dl
-
-  mov    cx, dx                          ; Do the copy
-  rep    movsw
+  rep    movsw                           ; Do the copy
 
   mov    ax, cs                          ; Restore ds
   mov    ds, ax
 
-  ; Setup the length for the UDP send
-  shl    dx, 1                           ; Go from words to bytes.
-  add    dx, Nd_Len                      ; Add the fixed len command header.
+
+  ; DX has the length of the raw data we are sending in this specific packet.
+  ; This is the first packet, so add the UDP and NetDrive command header to
+  ; the length.  (Subsequent fragment packets, if any, don't get the headers
+  ; repeated.)
+  add    dx, UDP_ND_LEN
 
 
-  ; Fill in the Eth, IP, and UDP headers and send the packet.  DX needs to
-  ; contain the length of the UDP payload (not including the UDP header.)
+  ; Fill in the Eth, IP, and UDP headers and send the packet.
   ; After the packet has been sent, setup the countdown timer.
 
   mov    cmd_resp_recved, 0
-  call   sendUDP
+
+  push   dx                              ; Save this packet payload length for sendPacket
+  call   prepIpFlags                     ; Figure out the IP header flags and fragment offset.
+  call   setEthIpHeaders                 ; Uses BX (flags) and DX (Payload length, not counting IP or Eth)
+  mov    ax, partial_chksum              ; Pass in the chksum computed over the NetDrive command header and the payload.
+  mov    dx, output_udp_len              ; This is not the length for this packet; it's the total UDP payload length!
+  call   setUdpHeader                    ; Uses AX and DX
+  pop    cx                              ; Restore the UDP payload length of this packet, previously pushed as DX
+  add    cx, 0x22                        ; Add the Ethernet and IP headers to it.
+  call   sendPacket
+
+
+
+
+  ; Bump the first fragment because it also had a command header and a UDP header.
+  add    fragment_offset, (UDP_ND_LEN / 8)
+
+
+  cmd_output_fragment_loop:
+
+  mov    ax, shared_data.net_pkt_send_dly ; If this is zero delay will return back immediately.
+  mov    delayParm, ax
+  call   delay
+
+  ; Decrement the remaining paragraphs to send, advance the local user buffer pointer,
+  ; and update the fragment index.
+  mov    ax, paras_this_pkt
+  sub    paras_to_send, ax
+
+  add    local_user_seg, ax
+
+  shl    ax, 1
+  add    fragment_offset, ax
+
+
+  ; SW: Is there more data to send?  If so, copy the user data to the packet data area,
+  ; call setEthIPHeaders, and then send it out.  Loop until there is no more data.
+
+
+  cmp    paras_to_send, 0
+  jz     cmd_output_wait
+
+
+
+  ; Figure out how many paragraphs we are sending this time.
+  mov    dx, shared_data.net_my_mtu
+  sub    dx, IP_HDR_LEN
+  shr    dx, 1                               ; Divide by 16
+  shr    dx, 1
+  shr    dx, 1
+  shr    dx, 1
+
+  ; DX has paragraphs available in the next packet.  Assume we are going to fill it.
+  mov    paras_this_pkt, dx
+  cmp    paras_to_send, dx
+  ja     cmd_output_pkt_paras_set2
+  mov    dx, paras_to_send
+  mov    paras_this_pkt, dx
+  cmd_output_pkt_paras_set2:
+
+
+  ; Copy the user data into the packet.  There is no UDP header this time.
+  ; Using MOVSW so source is in DS:SI, target is in ES:DI
+
+  mov    cx, paras_this_pkt              ; Put the number of words in CX
+  shl    cx, 1
+  shl    cx, 1
+  shl    cx, 1
+
+  mov    dx, cx                          ; Set the number of bytes in DX
+  shl    dx, 1
+
+  mov    bx, outgoing_buf_p
+  lea    di, [bx].out_udp_start
+  mov    si, cmd_user_buf_off
+  mov    ds, local_user_seg              ; Order is important here ... muck up DS last.
+
+  rep    movsw                           ; Do the copy
+
+  mov    ax, cs                          ; Restore ds
+  mov    ds, ax
+
+
+  ; Send the fragment out
+
+  call   prepIpFlags                     ; Figure out the IP header flags and fragment offset.
+  call   setEthIpHeaders                 ; Uses BX (flags) and DX (Payload length, not counting IP or Eth)
+  mov    cx, dx                          ; Restore the UDP payload length of this packet, previously pushed as DX
+  add    cx, 0x22                        ; Add the Ethernet and IP headers to it.
+  call   sendPacket
+
+  jmp    cmd_output_fragment_loop
+
+
+
+  cmd_output_wait:
+
+  ; The packet and possibly packet fragments have been sent and we are
+  ; waiting for a reply.  If this is a write verify operation compute
+  ; the check value the user data.
+  ;
+  ; Note that if this machine is slow enough the server can complete the write
+  ; and send back its CRC faster than we can compute it.  That value will be
+  ; saved and we'll check it when this code gets through the spin wait that
+  ; waits for a response.
+
+  cmp    cmd_op, Op_Write
+  jz     cmd_output_skip_crc
+
+  ; Compute the length of the user buffer
+  mov    cx, cmd_sectors_req             ; Given 512 byte blocks, compute number of bytes.
+  mov    ch, cl                          ; Fast shift to mult by 256.
+  xor    cl, cl                          ; Clear lower byte as part of the mult by 256.
+  shl    cx, 1                           ; One more shift to get to bytes.
+
+  ; CRC routine: Source is in DS:SI, length is in CX, DX has return value
+  mov    si, cmd_user_buf_off
+  mov    ds, cmd_user_buf_seg            ; Order is important here ... muck up DS last.
+
+  cmp    cx, 4096
+  ja     cmd_output_compute_fletcher
+
+  call   calcCRC
+  mov    ax, cs                               ; Restore DS
+  mov    ds, ax
+  mov    WORD PTR cmd_output_crc_lcl, dx      ; CRC16 value in low bytes
+  mov    WORD PTR cmd_output_crc_lcl + 2, 0   ; 0 for unused high bytes
+  jmp    cmd_output_skip_crc
+
+  cmd_output_compute_fletcher:
+  call   fck32
+  push   ax
+  mov    ax, cs                               ; Restore DS
+  mov    ds, ax
+  pop    ax
+  mov    WORD PTR cmd_output_crc_lcl, ax      ; Low bytes
+  mov    WORD PTR cmd_output_crc_lcl + 2, dx  ; High bytes
+
+  cmd_output_skip_crc:
+
   mov    ax, shared_data.net_pkt_timeout
   mov    countdownTimer, ax
 
@@ -709,6 +1197,11 @@ cmd_output_common:
 
   ; Nothing should have moved so just go back to the top of the loop and try again.
 
+
+  ; SW: We need to reset the pointers and start LBA back to the start of the group
+  ; and start the whole group over again.
+
+
   mov    si, curr_unit
   add    word ptr [si].unit_blocks_retries, 1
   adc    word ptr [si].unit_blocks_retries+2, 0
@@ -718,11 +1211,38 @@ cmd_output_common:
 
 
   cmd_output_check_result:
+
+  ; For a standard write we just check the return code from the server.  For a
+  ; write-verify we also have to compare the CRC that they computed against the
+  ; one that we computed.  Even if the server reported no error, if we detect
+  ; a mismatch on the final step it is an error.
+
   cmp    cmd_result, 0
   jnz    cmd_output_bad_result
 
+  cmp    cmd_op, Op_Write
+  jz     cmd_output_crc_good
+
+  mov    ax, WORD PTR cmd_output_crc_lcl      ; The CRC we computed.
+  cmp    ax, WORD PTR cmd_output_crc_rmt      ; The CRC from the server.
+  jne    cmd_output_crc_bad
+  mov    ax, WORD PTR cmd_output_crc_lcl + 2  ; The CRC we computed.
+  cmp    ax, WORD PTR cmd_output_crc_rmt + 2  ; The CRC from the server.
+  je     cmd_output_crc_good
+  
+  cmd_output_crc_bad:
+
+  mov    cmd_result, 1
+  jmp    cmd_output_bad_result
+
+
+  cmd_output_crc_good:
 
   ; The last response was good.  Advance the global sequence number.
+
+  ; SW: Advancing the sequence number is cool, but the pointers and start LBA are going
+  ; to jump a bit too.
+
 
   mov    si, curr_unit
   mov    ax, cmd_sectors_req
@@ -809,33 +1329,50 @@ setup_cmd_vars proc near
   mov    ax, es:[bx].rh_input_count      ; Sector count
   mov    cmd_count, ax
 
+
   ; What DOS are we on?  Use the RH length to determine where to read
   ; the starting LBA from as it can be either 16 or 32 bits.
 
   cmp    es:[bx].rh_input_rh.rh_len, 0x16
-  jnz    setup_cmd_vars_bigger_dos
+  jnz    setup_cmd_vars_1
 
-  setup_cmd_vars_use_start:
 
-  ; This is either an older DOS (2.x or 3.x) or DOS 4 and the start LBA is
-  ; small enough.  (Ignore Compaq DOS 3.3 and DR DOS for now.)
+  ; This is either an older DOS (2.x or 3.x) or DOS 4+ and the start LBA is
+  ; small enough.  Read a word from the original input_start location.
+
+  setup_cmd_vars_use_16bit_start:
 
   mov    ax, es:[bx].rh_input_start      ; 16 bit sector address
   mov    word ptr cmd_start, ax
   xor    ax, ax                          ; Clear the upper 16 bits.
   mov    word ptr cmd_start+2, ax
-
   ret
 
-  setup_cmd_vars_bigger_dos:
 
-  ; This is PC or MS DOS 4.x or above.  If the 16 bit start LBA is 0xFFFF
-  ; then use the 32 bit version, otherwise use the 16 bit version.
-  ;
-  ; Fixme: Add support for Compaq DOS 3.31 and DR DOS
+  setup_cmd_vars_1:
+
+  ; Is this Compaq DOS 3.31 or DR DOS 6?  If so the request header is 24 bytes
+  ; with the input_start field being extended to a double word.
+  ; https://faydoc.tripod.com/structures/25/2597.htm
+
+  cmp    es:[bx].rh_input_rh.rh_len, 0x18
+  jnz    setup_cmd_vars_2
+
+  mov    ax, word ptr es:[bx].rh_input_start   ; Low 16 bits
+  mov    word ptr cmd_start, ax
+  mov    ax, word ptr es:[bx].rh_input_start+2 ; High 16 bits
+  mov    word ptr cmd_start+2, ax
+  ret
+
+
+  setup_cmd_vars_2:
+
+  ; This is DOS 4.x or above and the request header length should be 0x1E.
+  ; If rh_input_start is set to 0xFFFF then use rh_input_hugeStart, 
+  ; otherwise go back and use rh_input_start.
 
   cmp    es:[bx].rh_input_start, 0xFFFF
-  jnz    setup_cmd_vars_use_start
+  jnz    setup_cmd_vars_use_16bit_start
 
   mov    ax, word ptr es:[bx].rh_input_hugeStart   ; Low 16 bits
   mov    word ptr cmd_start, ax
@@ -845,37 +1382,6 @@ setup_cmd_vars proc near
   ret
 
 setup_cmd_vars endp
-
-
-
-; Sets outgoing packet sequence, start and count, leaves count in DX.
-
-set_outgoing_ssc proc near
-
-  mov    si, curr_unit
-  mov    ax, [si].unit_sequence
-  mov    outgoing_buf.out_udp_start.pkt_nd_sequence, ax
-
-  mov    ax, word ptr cmd_start
-  mov    word ptr outgoing_buf.out_udp_start.pkt_nd_start, ax
-  mov    ax, word ptr cmd_start+2
-  mov    word ptr outgoing_buf.out_udp_start.pkt_nd_start+2, ax
-
-  mov    dx, 1                           ; Doing at least one
-  cmp    cmd_count, 1
-  jz     set_outgoing_ssc_just_one
-  inc    dx                              ; Doing two.
-
-  set_outgoing_ssc_just_one:
-
-  ; Update the sectors requested for this iteration and also set it in the packet.
-
-  mov    cmd_sectors_req, dx
-  mov    outgoing_buf.out_udp_start.pkt_nd_count, dx
-
-  ret
-
-set_outgoing_ssc endp
 
 
 
@@ -895,24 +1401,63 @@ update_local_ssc proc near
   add    word ptr cmd_start, ax          ; 32 bits so add with carry.
   adc    word ptr cmd_start+2, 0         ; Capture the carry bit.
 
-  add    cmd_user_buf_seg, 0x20          ; Advance 512 bytes
-  cmp    ax, 1
-  jz     update_local_ssc_2
-  add    cmd_user_buf_seg, 0x20          ; Unless we needed another 512 bytes.
-
-  update_local_ssc_2:
-
   sub    cmd_count, ax                   ; Update the number of sectors left to do.
+
+  mov    cl, 5                           ; Advance the user buffer pointer.  We do
+  shl    ax, cl                          ; this by segment instead of bytes as
+  add    cmd_user_buf_seg, ax            ; explained above.
+
   ret
 
 update_local_ssc endp
 
 
+
+
+; prepIpFlags
+;
+; Input:
+;   paras_to_send, paras_this_pkt and fragment_offset global vars
+;
+; Output:  
+;   BX: A word with the IP header flags and fragment offset ready to set.
+;       (It still needs to be byte swapped before sending.)
+;
+; Other than for the output, there are so side effects from this code.
+; It preserves AX so our callers have one less thing to worry about.
+
+prepIpFlags proc near
+
+  ; IP fragment logic - determine the more fragments flag.
+
+  ; IP fragment handling
+  ;
+  ; Set a flag in the IP header if there is going to be a fragment transmitted
+  ; after this packet.  (That happens when we have more sectors pending than
+  ; are being sent in this specific packet.)
+  ;
+  ; Fragment offsets are always on an eight byte boundary so the offset field
+  ; in the IP header doesn't send the low three bits.  Divide by 8 here and
+  ; merge with the fragment flag.  It's not worth skipping if the fragment
+  ; offset is zero as it's just some shifting and an and.
+
+  mov    bx, paras_to_send
+  cmp    paras_this_pkt, bx
+  mov    bx, fragment_offset
+  jl     more_fragments
+
+  ret
+
+  more_fragments:
+  or     bx, IP_HDR_MOREFRAGS
+  ret
+
+prepIpFlags endp
+
+
+
 ; ============================================================================
-
-
-
-
+;
 ; processArpRequest
 ;
 ; If this an ARP request for us?  If so, stash the requesting
@@ -925,8 +1470,9 @@ update_local_ssc endp
 ; check for the target_ip first to see if it is us before checking
 ; everything else.
 ;
-; Assumes: DS and ES are set
-; Saves and restores any register it touches
+; On entry
+;   SI is pointing at the incoming buffer.
+;   DS and ES should be set.
 ;
 ; Preconditions: Ethernet target hardware address = broadcast and EtherType = ARP
 ;
@@ -940,31 +1486,27 @@ update_local_ssc endp
 
 processArpRequest proc near
 
-  push   ax
-  push   si
-  push   di
-  push   cx
-
   ; If there is already a pending ARP request do not obliterate it.
   cmp    arp_pending, 1
-  jz     arp_req_exit
+  je     arp_req_exit
 
-  cmp    word ptr incoming_buf.pkt_arp_hdw_type, 0x0100
-  jnz    arp_req_exit
-  cmp    word ptr incoming_buf.pkt_arp_prot_type, 0x0008
-  jnz    arp_req_exit
-  cmp    incoming_buf.pkt_arp_hlen, 0x06
-  jnz    arp_req_exit
-  cmp    incoming_buf.pkt_arp_plen, 0x04
-  jnz    arp_req_exit
-  cmp    word ptr incoming_buf.pkt_arp_op, 0x0100
-  jnz    arp_req_exit
+  mov    si, incoming_buf_p
+  cmp    word ptr [si].pkt_arp_hdw_type, 0x0100
+  jne    arp_req_exit
+  cmp    word ptr [si].pkt_arp_prot_type, 0x0008
+  jne    arp_req_exit
+  cmp    [si].pkt_arp_hlen, 0x06
+  jne    arp_req_exit
+  cmp    [si].pkt_arp_plen, 0x04
+  jne    arp_req_exit
+  cmp    word ptr [si].pkt_arp_op, 0x0100
+  jne    arp_req_exit
   mov    ax, word ptr shared_data.net_my_ip
-  cmp    ax, word ptr incoming_buf.pkt_arp_target_ip
-  jnz    arp_req_exit
+  cmp    ax, word ptr [si].pkt_arp_target_ip
+  jne    arp_req_exit
   mov    ax, word ptr shared_data.net_my_ip+2
-  cmp    ax, word ptr incoming_buf.pkt_arp_target_ip+2
-  jnz    arp_req_exit
+  cmp    ax, word ptr [si].pkt_arp_target_ip+2
+  jne    arp_req_exit
 
   ; It's ours ..  stash what we need for later.
   ; Fixme: this is last in wins.  Do we need to support
@@ -973,7 +1515,7 @@ processArpRequest proc near
   mov    arp_pending, 1
 
   ; Copy the sending hardware address to the target Ethernet address
-  mov    si, OFFSET incoming_buf.pkt_arp_sender_ha
+  add    si, pkt_arp_sender_ha
   mov    di, OFFSET shared_data.net_arp_resp.pkt_arp_eth_dest
   movsw
   movsw
@@ -981,7 +1523,8 @@ processArpRequest proc near
 
   ; Copy the sending hardware address and IP address.
   ; Using MOVSW so source is in DS:SI, target is in ES:DI
-  mov    si, OFFSET incoming_buf.pkt_arp_sender_ha
+  mov    si, incoming_buf_p
+  add    si, pkt_arp_sender_ha
   mov    di, OFFSET shared_data.net_arp_resp.pkt_arp_target_ha
   movsw
   movsw
@@ -992,446 +1535,657 @@ processArpRequest proc near
   ; And now it is ready to be sent at the next opportunity.
 
   arp_req_exit:
-  pop    cx
-  pop    di
-  pop    si
-  pop    ax
   ret
 
 processArpRequest endp
 
 
 
+; ============================================================================
+;
 ; receivepacket
 ;
-; The packet driver will be given this function to use.  For each packet
-; there will be two calls:
+; The packet driver will call this function twice for each received packet:
 ;
-; First call: AX=0, CX=packet len
-;   If you can handle the packet then return an address to a buffer in ES:DI
+; First call: AX=0, BX=handle, CX=packet len
+;   If you can handle the packet then return an address to a buffer in ES:DI.
 ;   If not, ES:DI is set to 0.
 ;
-; Second call: CX=packet len
-;   Process the buffer now.  For this driver we need a quick check to see
-;   if it is our IP addess and port.  If it is, then we can check the checksum
-;   and other processing, otherwise exit quickly to avoid slowing things down.
+; Second call: AX=1, BX=handle, CX=packet len, DS:SI is our buffer
+;   Process the packet if it is ours, or pass it to a downstream user.
+;
+; If we have a downstream user we'll pretend we are the packet driver and
+; give them the buffer if the packet is not exclusively for NetDrive.
+
 
 receivePacket proc far
 
-       ; Is this the first call from the packet driver?
-       test ax, ax
-       jnz receiveSecondCall
+  ; Is this the first call from the packet driver?
+  cmp    ax, 1
+  je     receiveSecondCall
+       
+  ; Are we processing packets yet?
+  cmp    cs:shared_data.net_pkt_recv_on, 0
+  je     receive_no_thanks
 
-       ; If we are not processing packets yet then jump to the code that returns
-       ; a zero for the target buffer.
+  ; Packet too big?  Reject it.
+  cmp    cx, ETH_FRAME_SIZE
+  ja     receive_no_thanks
 
-       ; Test is like a non-destructive AND.  ZF is set if all bits are off.
-       test cs:shared_data.net_pkt_recv_on, 1
-       jz receiveDisabled
-
-       ; Packet too big?  Reject it.
-       cmp cx, ETH_BUF_RECV_SIZE
-       jg receiveDisabled
-
-       ; Give them the buffer to copy to for the next call
-       mov di, OFFSET incoming_buf 
-       mov ax, cs
-       mov es, ax
-       retf                                   ; Early return!
-
-receiveDisabled:
-       xor ax, ax
-       mov di, ax
-       mov es, ax
-       retf                                   ; Early return!
-
-receiveSecondCall:
-
-       ; Push flags to preserve the direction flag for the caller, then clear it for us.
-       pushf
-       cld
-
-       ; Switch to a private stack first.
-       switchToStack recvint
-
-       ; We're going to be here a while.  Save registers that we are going to
-       ; touch and re-establish es and ds so we don't need to keep prefixing with cs.
-
-       push bx
-       push cx
-       push dx
-       push bp
-       push si
-       push di
-       push ds
-       push es
-
-       mov ax, cs
-       mov ds, ax
-       mov es, ax
+  ; OK, we'll take it.  Give them the buffer to copy to for the next call.
+  mov    di, cs:incoming_buf_p
+  mov    ax, cs
+  mov    es, ax
+  retf
 
 
-       ; Increment total number of packets received.
-       add word ptr shared_data.net_c_r_total, 1
-       adc word ptr shared_data.net_c_r_total+2, 0
+  receive_no_thanks:
+  xor    ax, ax
+  mov    di, ax
+  mov    es, ax
+  retf
 
-       ; Assume this will be shared with a downstream program.
-       mov  dontShare, 0
 
-       ; Is this packet for us? (Same MAC address)
-       mov di, OFFSET incoming_buf 
-       mov si, OFFSET shared_data.net_my_mac
-       mov cx, 3
-       repz cmpsw 
+  receiveSecondCall:
 
-       ; If you get here and zero flag is set all 3 words were compared and are equal.
-       jz ourpacket
+  ; We are going to be here for a while and we are going to touch lots of registers.
+  ; Switch to a private stack, save the registers, and setup DS.  We don't need to
+  ; worry about what AX after the stack switch because we know what it was on entry
+  ; and it is not needed now.
 
-       ; Was this a broadcast packet?
-       cmp word ptr incoming_buf.pkt_arp_eth_dest, 0xffff
-       jnz receiveExit
-       cmp word ptr incoming_buf.pkt_arp_eth_dest+2, 0xffff
-       jnz receiveExit
-       cmp word ptr incoming_buf.pkt_arp_eth_dest+4, 0xffff
-       jnz receiveExit
+  switchToStack recvint
 
-       ; The only broadcast packet we care about is ARP.
-       cmp word ptr incoming_buf.pkt_arp_eth_type, Eth_Type_Arp
-       jnz receiveExit
+  push   bx
+  push   cx
+  push   dx
+  push   bp
+  push   si
+  push   di
+  push   ds
+  push   es
+  pushf
 
-       ; processArpRequest modifies ax but we don't need it anymore.
-       call processArpRequest
-       jmp receiveExit
+  cld
+
+  mov    ax, cs                          ; Setup DS and DS
+  mov    ds, ax
+  mov    es, ax
+
+  mov  incoming_pkt_len, cx              ; Save the incoming length for later.
+
+  ; Increment total number of packets received.
+  add    word ptr shared_data.net_c_r_total, 1
+  adc    word ptr shared_data.net_c_r_total+2, 0
+
+  ; Is this packet for us? (Same MAC address)
+  mov    si, incoming_buf_p              ; Eth dest is right at the start.
+  mov    di, OFFSET shared_data.net_my_mac
+  mov    cx, 3
+  repz   cmpsw 
+
+  ; If you get here and zero flag is set all 3 words were compared and are equal.
+  je     ourpacket
+
+  ; Was this a broadcast packet?
+  mov    si, incoming_buf_p              ; Eth dest is right at the start.
+  mov    di, OFFSET eth_broadcast
+  mov    cx, 3
+  repz   cmpsw 
+
+  ; This is not a broadcast packet; send it downstream.
+  jne     receive_check_downstream_bounce
+
+  ; The only broadcast packet we care about is ARP.
+  mov    si, incoming_buf_p              ; Eth dest is right at the start.
+  cmp    word ptr [si].pkt_arp_eth_type, ETH_TYPE_ARP
+  jne    receive_check_downstream_bounce
+
+  ; processArpRequest modifies ax but we don't need it anymore.
+  call   processArpRequest
+  jmp receive_check_downstream           ; Bounce jump not needed here.
 
 
 ourpacket:
-       add word ptr shared_data.net_c_r_our_mac, 1
-       adc word ptr shared_data.net_c_r_our_mac+2, 0
+  add    word ptr shared_data.net_c_r_our_mac, 1
+  adc    word ptr shared_data.net_c_r_our_mac+2, 0
 
-       ; Was it ARP directly to us?
-       cmp word ptr incoming_buf.pkt_arp_eth_type, Eth_Type_Arp
-       jnz receiveIpCheck
+  ; Was it ARP directly to us?
+  mov    si, incoming_buf_p
+  cmp    word ptr [si].pkt_arp_eth_type, ETH_TYPE_ARP
+  jne    receiveIpCheck
 
-       call processArpRequest
-       jmp receiveExit
-       
+  call   processArpRequest
+  ; Fall through
+
+  ; This little hack is to help the code generation of the assembler, as the
+  ; jump to receive_check_downstream is too far for a je or jne instruction.
+  receive_check_downstream_bounce:
+  jmp    receive_check_downstream
+
 
 receiveIpCheck:
 
-       ; Do some quick checks to see if it's IPv4 and UDP.  If it is then we
-       ; can check to see if it is to us and from the server.  This order of
-       ; checking allows us to bail out quickly if it's not for this driver.
-
-       ; EtherType is IP (0x0800)
-       cmp word ptr incoming_buf.pkt_ip_eth_type, Eth_Type_Ip
-       jnz receiveExit
-
-       ; IP version is 0x04
-       mov al, incoming_buf.pkt_ip_vers_hlen
-       and al, 0xf0
-       cmp al, 0x40
-       jnz receiveExit
-
-       cmp incoming_buf.pkt_ip_protocol, Ip_Udp_protocol
-       jnz receiveExit
-
-       mov ax, word ptr shared_data.net_my_ip
-       cmp ax, word ptr incoming_buf.pkt_ip_dest
-       jnz receiveExit
-       mov ax, word ptr shared_data.net_my_ip+2
-       cmp ax, word ptr incoming_buf.pkt_ip_dest+2
-       jnz receiveExit
-
-       mov si, curr_unit
-
-       mov ax, word ptr [si].unit_server_ip
-       cmp ax, word ptr incoming_buf.pkt_ip_src
-       jnz receiveExit
-       mov ax, word ptr [si].unit_server_ip+2
-       cmp ax, word ptr incoming_buf.pkt_ip_src+2
-       jnz receiveExit
-
-
-       ; Checking the UDP port is a bit more involved, as the UDP packet is
-       ; not in a fixed location because of possible IP header options.
-       ; The hlen field represents the header length in 4 byte quantities.
-       ; Read the number of bytes for the IP header and compute an offset
-       ; to the start of the UDP header.
-
-       xor dx, dx
-       mov dl, incoming_buf.pkt_ip_vers_hlen
-       and dl, 0x0f
-       shl dx, 1               ; DX now has the IP header length in words
-       shl dx, 1               ; DX now has the IP header length in bytes
-       add dx, Eth_hdr_len     ; DX now has an offset to the UDP header.
-
-       ; The source port needs to match the server port and the destination
-       ; port needs to match our local port.  (And remember, network byte order.)
-
-       mov si, OFFSET incoming_buf
-       add si, dx              ; Skip past Eth and IP headers.
-
-       lodsw                   ; pkt_udp_src
-       xchg ah, al
-       mov di, curr_unit
-       cmp ax, [di].unit_server_port
-       jnz receiveExit
-
-       lodsw                   ; pkt_udp_dest
-       xchg ah, al
-       cmp ax, shared_data.net_my_port
-       jnz receiveExit
+  ; Do some quick checks to see if it's IPv4 and UDP.  If it is then we
+  ; can check to see if it is to us and from the server.  This order of
+  ; checking allows us to bail out quickly if it's not for this driver.
+
+  ; EtherType is IP (0x0800)
+  cmp    word ptr [si].pkt_ip_eth_type, ETH_TYPE_IP
+  jne    receive_check_downstream_bounce
+
+  ; IP version is 0x04
+  mov    al, [si].pkt_ip_vers_hlen
+  and    al, 0xf0
+  cmp    al, 0x40
+  jnz    receive_check_downstream_bounce
+
+  cmp    [si].pkt_ip_protocol, IP_UDP_PROTOCOL
+  jne    receive_check_downstream_bounce
+
+  mov    ax, word ptr shared_data.net_my_ip
+  cmp    ax, word ptr [si].pkt_ip_dest
+  jne    receive_check_downstream_bounce
+  mov    ax, word ptr shared_data.net_my_ip+2
+  cmp    ax, word ptr [si].pkt_ip_dest+2
+  jne    receive_check_downstream_bounce
+
+  mov    di, curr_unit
+
+  mov    ax, word ptr [di].unit_server_ip
+  cmp    ax, word ptr [si].pkt_ip_src
+  jne    receive_check_downstream_bounce
+  mov    ax, word ptr [di].unit_server_ip+2
+  cmp    ax, word ptr [si].pkt_ip_src+2
+  jne    receive_check_downstream_bounce
+
+
+  ; Checking the UDP port is a bit more involved, as the UDP packet is
+  ; not in a fixed location because of possible IP header options.
+  ; The hlen field represents the header length in 4 byte quantities.
+  ; Read the number of bytes for the IP header and compute an offset
+  ; to the start of the UDP header.
+
+  xor    dx, dx
+  mov    dl, [si].pkt_ip_vers_hlen
+  and    dl, 0x0f
+  shl    dx, 1                           ; DX now has the IP header length in words
+  shl    dx, 1                           ; DX now has the IP header length in bytes
+  add    dx, ETH_HDR_LEN                 ; DX now has an offset to the UDP header.
+
+  ; The source port needs to match the server port and the destination
+  ; port needs to match our local port.  (And remember, network byte order.)
+
+  add    si, dx                          ; Skip past Eth and IP headers.
+
+  lodsw                                  ; pkt_udp_src
+  xchg   ah, al
+  mov    di, curr_unit
+  cmp    ax, [di].unit_server_port
+  jne    receive_check_downstream_bounce
+
+  lodsw                                  ; pkt_udp_dest
+  xchg   ah, al
+  cmp    ax, shared_data.net_my_port
+  jne    receive_check_downstream_bounce
+
+  ; This packet is definitely for us; don't pass it to the next user.
+  ; Do this by jumping to receive_exit if we want to leave.
+
+  ; Ok, everything matches.  Verify the IP checksum
+  mov    si, incoming_buf_p
+  call   computeIpChecksum
+  cmp    ax, 0
+  jne    receive_exit_bounce
+
+
+  ; UDP checksums are optional.  If it is 0 then don't check it.
+
+  ; Get to the IP header, then extract the length and get to the UDP header.
+  mov    si, incoming_buf_p
+  add    si, pkt_ip_vers_hlen
+  xor    ax, ax
+  mov    al, byte ptr [si]
+  and    al, 0x0f
+  shl    ax, 1
+  shl    ax, 1
+  add    si, ax
+  mov    ax, [si+pkt_udp_chksum]
+
+  cmp    ax, 0
+  je     receiveSkipUdpChksum
+
+  ; The UDP checksum is set so check it.  
+  mov    si, incoming_buf_p
+  xor    ax, ax
+  call   computeUdpChecksum
+  cmp    ax, 0
+  jne    receive_exit_bounce
+
+  receiveSkipUdpChksum:
+
+  ; Checksum was good.  Bump the counter of UDP packets destined for us.
+  add    word ptr shared_data.net_c_r_our_udp, 1
+  adc    word ptr shared_data.net_c_r_our_udp+2, 0
 
-       ; This packet is definitely for us; don't pass it to the next user.
-       mov  dontShare, 1
-
-       ; Ok, everything matches.  Verify the IP checksum
-       mov  si, OFFSET incoming_buf
-       call computeIpChecksum
-       cmp  ax, 0
-       jnz  receiveExit
 
 
-       ; UDP checksums are optional.  If it is 0 then don't check it.
+  ; The next sequence of checks verifies that the received response has
+  ; at least a full command header and that that the session and sequence
+  ; number match.  If everything checks out process the packet now because
+  ; another incoming packet will obliterate this packet.  (ReadAhead doesn't
+  ; need an exact match on the sequence number, so it will do its own checking.)
+  ;
+  ; If it is a good read copy the payload too.  (You can only copy the
+  ; payload if you know there is a user buffer setup waiting for it.)
 
-       ; Get to the IP header, then extract the length and get to the UDP header.
-       mov   si, OFFSET incoming_buf.pkt_ip_vers_hlen
-       xor   ax, ax
-       mov   al, byte ptr [si]
-       and   al, 0x0f
-       shl   ax, 1
-       shl   ax, 1
-       add   si, ax
-       mov   ax, [si+pkt_udp_chksum]
-
-       cmp   ax, 0
-       jz    receiveSkipUdpChksum
+  ; Setup so we can directly access the UDP portion of the packet.
+  ; Then check the fields strictly to ensure this is what we asked for.
+  mov    bx, incoming_buf_p
+  add    bx, pkt_udp_src
+  add    bx, dx
 
-       ; The UDP checksum is set so check it.  
 
-       mov  si, OFFSET incoming_buf
-       call computeUdpChecksum
-       cmp  ax, 0
-       jnz receiveExit
+  ; Verify that we received something that at least has a full command header.
+  mov    ax, [bx].pkt_udp_len
+  xchg   al, ah                          ; Never forget, network byte order for UDP fields.
+  cmp    ax, UDP_ND_LEN
+  jb     receive_exit_bounce
 
-       receiveSkipUdpChksum:
+  ; Fixme: Should we check the protocol version here just to be complete?
 
-       ; Checksum was good.  Bump the counter of UDP packets destined for us.
-       add word ptr shared_data.net_c_r_our_udp, 1
-       adc word ptr shared_data.net_c_r_our_udp+2, 0
 
-       ; Verify the session and sequence number.  Both have to match perfectly.
-       ; If they do match, copy what we need from the packet because the next
-       ; incoming packet will obliterate it.
-       ;
-       ; If it is a good read copy the payload too.  (You can only copy the
-       ; payload if you know there is a user buffer setup waiting for it.)
+  ; Does the session match?
+  mov    si, curr_unit
+  mov    ax, [si].unit_session
+  cmp    ax, [bx].pkt_nd_session
+  jne    receive_exit_bounce
 
+  ; Before checking the sequence number see if this is a ReadAhead packet.
+  ; That code will do its own checks on the sequence number.
+  cmp    [bx].pkt_nd_op, Op_ReadAheadPkt
+  jne    receive_not_readahead
+  call   receive_ReadAhead
 
-       ; Setup so we can directly access the UDP portion of the packet.
-       ; Then check the fields strictly to ensure this is what we asked for.
-       mov bx, OFFSET incoming_buf.pkt_udp_src
-       add bx, dx
+  ; Another cheap hack to improve code size and performance.
+  receive_exit_bounce:
+  jmp    receive_exit
 
-       mov si, curr_unit
-       mov ax, [si].unit_session
-       cmp ax, [bx].pkt_nd_session
-       jnz receiveExit
 
-       mov ax, [si].unit_sequence
-       cmp ax, [bx].pkt_nd_sequence
-       jnz receiveExit
+  receive_not_readahead:
+  ; Ensure the sequence number, operation, start sector, and number
+  ; of sectors is an exact match.
+
+  mov    ax, [si].unit_sequence
+  cmp    ax, [bx].pkt_nd_sequence
+  jne    receive_exit_bounce
 
-       mov al, cmd_op
-       cmp al, [bx].pkt_nd_op
-       jnz receiveExit
+  mov    al, cmd_op
+  cmp    al, [bx].pkt_nd_op
+  jne    receive_exit_bounce
+
+  mov    ax, word ptr cmd_start
+  cmp    ax, word ptr [bx].pkt_nd_start
+  jne    receive_exit_bounce
+  mov    ax, word ptr cmd_start+2
+  cmp    ax, word ptr [bx].pkt_nd_start+2
+  jne    receive_exit_bounce
+
+  mov    ax, cmd_sectors_req
+  cmp    ax, [bx].pkt_nd_count
+  jne    receive_exit_bounce
+
+
+  ; One last check - are we actually waiting for something?  (Is a DOS read
+  ; or write active in this device driver?)  If so then process this packet.
+  ; Otherwise, this is a duplicate packet and there is no point in processing
+  ; it.  It is a small timing ; window but we need to check it.
+
+  cmp    cmd_active, 1
+  jne    receive_exit_bounce
+  cmp    cmd_resp_recved, 0
+  jne    receive_exit_bounce
 
-       mov ax, word ptr cmd_start
-       cmp ax, word ptr [bx].pkt_nd_start
-       jnz receiveExit
-       mov ax, word ptr cmd_start+2
-       cmp ax, word ptr [bx].pkt_nd_start+2
-       jnz receiveExit
 
-       mov ax, cmd_sectors_req
-       cmp ax, [bx].pkt_nd_count
-       jnz receiveExit
-
-       ; One last check - are we actually waiting for something?  Also, if we are
-       ; already processing something that has been received then don't clobber
-       ; anything as this was either a dupe or speculative.  It's a small timing
-       ; window but we need to check it.
-
-       cmp cmd_active, 1
-       jnz receiveExit
-       cmp cmd_resp_recved, 0
-       jnz receiveExit
-
-
-       ; Everything matches.  Copy what we need.
-
-       mov al, [bx].pkt_nd_result
-       mov cmd_result, al
-
-       mov cmd_resp_recved, 1
-
-
-       ; Was this a write with verify?
-       cmp cmd_op, Op_Write_Verify
-       jz receive_write_verify
-
-
-       ; Only copy the payload for a successful read.  The server might send
-       ; diagnostic information in the payload which shows up in a packet
-       ; trace but we generally don't have a buffer to copy it too.
-
-       cmp cmd_op, Op_read
-       jnz receiveExit
-       cmp cmd_result, 0
-       jnz receiveExit
-
-
-       ; This is a successful read.  Copy the payload, but only copy what we
-       ; requested.  If the number of received bytes doesn't match the expected
-       ; bytes then we mark this as bad.
-
-       mov ax, [bx].pkt_udp_len
-       xchg al, ah                  ; Never forget, network byte order for UDP fields.
-       sub ax, Udp_Nd_Len
-       jz receiveExit
-
-       mov dx, cmd_sectors_req      ; Number of sectors we requested on the last pass.
-       mov cl, 9
-       shl dx, cl                   ; Times 512.
-
-       cmp ax, dx
-       jz receive_copy              ; All good, copy the payload.
-
-       ; Mark the command as bad and exit
-       mov cmd_result, 1
-       jmp receiveExit
-
-receive_copy:
-
-       ; Using MOVSW so source is in DS:SI, target is in ES:DI
-
-       lea  si, [bx+pkt_nd_data]
-       mov  es, cmd_user_buf_seg
-       mov  di, cmd_user_buf_off
-       mov  cx, ax                  ; Payload length from above
-       shr  cx, 1                   ; Divide by two for word moves
-       rep  movsw
-
-       and  ax, 1
-       jz receiveExit
-       movsb                        ; Move the last odd byte.
-       jmp receiveExit
-
-
-receive_write_verify:
-
-       ; We have the buffer we went sitting in cmd_user_buf_seg and _off.
-       ; The payload should have the re-read of what we just sent.
-
-       mov dx, cmd_sectors_req
-       mov cl, 8
-       shl dx, cl                   ; Number of words to compare.
-       mov cx, dx
-
-       ; No need to verify the incoming buffer length.  If it's wrong we'll probably
-       ; have a miscompare, and that is fine.
-
-       mov  es, cmd_user_buf_seg
-       mov  di, cmd_user_buf_off
-
-       lea  si, [bx+pkt_nd_data]
-
-       repz cmpsw
-
-       ; If you get here and zero flag is set everything was compared and equal.
-       jz receiveExit
-
-       ; Set a bad return code ...
-       mov cmd_result, 1
-
-receiveExit:
-
-       pop es
-       pop ds
-       pop di
-       pop si
-       pop bp
-       pop dx
-       pop cx
-       pop bx
-
-       ; Restore prior stack.  We still have flags pushed on the original stack
-       ; because we cleared the direction flag and we still need to restore it.
-       switchFromStack recvint
-
-
-       ; Is there somebody waiting for this packet?
-       ; I'm not proud of this code but it seems to work.  Make it more robust.
-
-       cmp    word ptr cs:theirReceiver, 0
-       jnz    receiveExit_receiver1
-       cmp    word ptr cs:theirReceiver+2, 0
-       jz     receive_realexit
-
-       receiveExit_receiver1:
-       cmp    cs:dontShare, 1
-       jz     receive_realexit
-
-       ; Call them the first time.  If they give us a buffer continue.
-       mov    ax, 0
-       call   cs:[theirReceiver]
-       cmp    di, 0
-       jnz    receiveExit_receiver2
-       mov    ax, es
-       cmp    ax, 0
-       jz     receive_realexit
-
-
-       receiveExit_receiver2:
-
-       ; The user gave us a pointer to a buffer in ES:DI.  CX is already set; it
-       ; was saved on entry and restored with the pop command above.
-
-       ; Save ES:DI (their buffer) for later when we have to return it in DS:SI.
-       push   es
-       push   di
-
-       ; Source is our packet (DS:SI)
-       mov    si, OFFSET incoming_buf 
-       mov    ax, cs
-       mov    ds, ax
-
-       ; Setup for moving a word at a time.  Preserve CX so we can see if
-       ; there is an odd byte to move.
-       push   cx
-       shr    cx, 1
-       rep    movsw
-       pop    cx
-       and    cx, 1
-       jz     receiveExit_receiver3
-       movsb
-
-       receiveExit_receiver3:
-
-       ; We're supposed to set DS:SI to the buffer we copied the packet into.
-       pop    si
-       pop    ds
-
-       mov    ax, 1
-       call   cs:[theirReceiver]
-
-       receive_realexit:
-       popf
-       retf
+  ; Everything matches and we are expecting it.
+  ;
+  ; Copy the return code and indicate that the response was received.
+  ; If this is a bad return code then we are done.
+
+  mov    cmd_resp_recved, 1
+  mov    al, [bx].pkt_nd_result
+  mov    cmd_result, al
+  cmp    al, 0
+  jne    receive_exit_bounce
+
+  ; Write with verify has extra work to do.
+  cmp    cmd_op, Op_Write_Verify
+  je     receive_write_verify
+
+  ; Is this a plain write?  If so then there is nothing else to do.
+  cmp    cmd_op, Op_Write
+  je     receive_exit_bounce
+
+  ; This is a successful read.  Copy the payload, but only copy what we
+  ; requested.  If the number of received bytes doesn't match the expected
+  ; bytes then we mark this as bad.
+
+  mov    ax, [bx].pkt_udp_len
+  xchg   al, ah                          ; Never forget, network byte order for UDP fields.
+  sub    ax, UDP_ND_LEN                  ; This is safe; we checked for a minimum length earlier.
+
+  mov    dx, cmd_sectors_req             ; Number of sectors we requested on the last pass.
+  mov    cl, 9
+  shl    dx, cl                          ; Times 512.
+
+  cmp    ax, dx
+  je     receive_copy                    ; All good, copy the payload.
+
+  ; Mark the command as bad and exit
+  mov    cmd_result, 1
+  jmp    receive_exit
+
+
+  receive_copy:
+
+  ; Using MOVSW so source is in DS:SI, target is in ES:DI
+
+  lea    si, [bx+pkt_nd_data]
+  mov    es, cmd_user_buf_seg
+  mov    di, cmd_user_buf_off
+  mov    cx, ax                          ; Payload length from above
+  shr    cx, 1                           ; Divide by two for word moves
+  rep    movsw
+
+  and    ax, 1
+  jz     receive_exit
+  movsb                                  ; Move the last odd byte.
+  jmp    receive_exit
+
+
+  receive_write_verify:
+  ; Instead of getting back what we wrote, we get a 16 bit CRC computed
+  ; by the other side after they write and read back the data.  Copy
+  ; the received CRC to a safe place and mark the command as completed.
+  ; The cmd_output routine will do the final check to ensure the local
+  ; and remote CRCs matched.
+  ;
+  ; Making the output routine do the comparison saves us from when the
+  ; server is far faster than the DOS machine and responds faster than
+  ; the DOS machine can compute the CRC.  We used to just disable
+  ; interrupts until the DOS machine was done; that worked but this
+  ; is more elegant and prevents lost timer tick interrupts.
+
+  ; Verify they sent us a CRC in the length.
+
+  mov    ax, [bx].pkt_udp_len
+  xchg   al, ah                          ; Never forget, network byte order for UDP fields.
+  sub    ax, UDP_ND_LEN                  ; This is safe; we checked for a minimum length earlier.
+  cmp    ax, 4
+  jne    receive_write_verify_bad_payload
+
+  ; Save the CRC sent to us.  It will be checked after the spin wait loop exits.
+  mov    ax, word ptr [bx].pkt_nd_data
+  mov    WORD PTR cmd_output_crc_rmt, ax
+  mov    ax, word ptr [bx].pkt_nd_data + 2
+  mov    WORD PTR cmd_output_crc_rmt + 2, ax
+  jmp    receive_exit
+
+  receive_write_verify_bad_payload:
+  ; Somehow we got a mal-formed packet.  Force the return code to bad and exit.
+  mov    [bx].pkt_nd_result, 1
+  jmp    receive_exit
+
+
+  receive_check_downstream:
+  ; Is there somebody waiting for this packet?
+  cmp    handles_in_use, 0
+  je     receive_exit
+  call   receive_send_downstream
+
+
+  receive_exit:
+  popf
+  pop    es
+  pop    ds
+  pop    di
+  pop    si
+  pop    bp
+  pop    dx
+  pop    cx
+  pop    bx
+
+  switchFromStack recvint
+
+  retf
 
 receivePacket endp
 
 
+
+receive_ReadAhead proc near
+
+  ; On entry BX points at the packet UDP header.  Don't alter it.
+
+  ; Every active command sets the active unit number (curr_unit), and to
+  ; get to this point you have to match the server, port, and session of
+  ; the active command.  Old readahead packets from a different unit
+  ; arriving late would not have made it this far.
+  ;
+  ; Validate that the sequence number in the packet is equal to or greater
+  ; than the sequence number when DOS issued a read to the device driver.
+  ; That protects us against old-readahead data coming in when we are doing
+  ; back-to-back reads on the same unit.  Later sequence numbers are ok,
+  ; as they will be using the same buffer the DOS caller provided.  (When
+  ; the DOS caller ; starts a new read we update the read-ahead variables.)
+  ;
+  ; This check can fail if the command sequence number wraps during a read
+  ; operation.  That's fine, it will just disable read-ahead caching for
+  ; the duration of that read command and resume on the next one.
+
+  mov    ax, word ptr [bx].pkt_nd_sequence
+  cmp    ax, ra_seq_start
+  jb     receive_ReadAhead_exit
+
+  
+  ; Is the payload length what we expect?
+
+  mov    ax, [bx].pkt_udp_len
+  xchg   al, ah                          ; Never forget, network byte order for UDP fields.
+  sub    ax, UDP_ND_LEN                  ; This is safe; we checked for a minimum length earlier.
+
+  mov    dx, [bx].pkt_nd_count           ; Multiply the number of blocks by 512
+  mov    cl, 9
+  shl    dx, cl
+
+  cmp    ax, dx
+  jne    receive_ReadAhead_exit
+
+
+  ; This is our readahead.  Setup to copy the first block in the packet.
+  mov    ra_receive_index, 0
+
+  receive_ReadAhead1:
+
+  ; The user issued a read, and the starting LBA is in ra_lba_start (32 bits).
+  ; The count is in ra_lba_count (16 bits).  The user buffer is in ra_buf_seg and ra_buf_off.
+
+  ; Using MOVSW so source is in DS:SI, target is in ES:DI.
+
+  ; Position to the correct place in the packet.  (Either offset 0 or 512.)
+  lea    si, [bx+pkt_nd_data]
+  mov    ax, ra_receive_index
+  mov    cx, 9
+  shl    ax, cl
+  add    si, ax
+
+  ; Figure out where we are going to copy the first block in the packet to.
+  ; The packet has pkt_nd_start, which is a 32 bit LBA start address.
+  ; Compute the difference between that and ra_lba_start to get a sector
+  ; offset and multiply that by 512 to get the target offset into the user buffer.
+
+  ; The difference always fits in 16 bits so there is no need to to the
+  ; high word with the sbb, which uses the carry flag to fix the upper word.
+  mov    ax, word ptr [bx].pkt_nd_start
+  sub    ax, word ptr ra_lba_start
+  ;mov    ax, word ptr [bx].pkt_nd_start+2
+  ;sbb    ax, word ptr ra_lba_start+2
+
+
+  ; AX now has the number of block from the start of the originally supplied
+  ; user buffer to the first block in this packet.  Bump that number if we
+  ; are processing the second block in a packet.
+  add    ax, ra_receive_index
+
+  ; If this block doesn't fit in the originally supplied user buffer then somebody
+  ; screwed up - discard the packet.
+  cmp    ra_lba_count, ax
+  jbe    receive_ReadAhead_exit
+
+  ; If this block is beyond what we can mark in the readahead bitmap then
+  ; somebody screwed up - discard the packet.
+  cmp    ax, RA_MAX_BLOCK
+  ja     receive_ReadAhead_exit
+
+  ; Save AX temporarily so we can use it to turn on the bit in our readahead bitmap.
+  push   ax
+
+  ; Multiply AX by 32 to get the number of paragraphs that we are going to
+  ; skip.  Then add that to ra_buf_seg to get the starting segment to copy
+  ; into.  We don't ever mess with the offset so use ra_buf_off directly.
+
+  mov    cl,5
+  shl    ax,cl
+  mov    di, ra_buf_off
+  add    ax, ra_buf_seg
+  mov    es, ax
+  mov    cx, 256                         ; Copy!
+  rep    movsw
+
+  ; Now we have to turn on the appropriate bit in the ra_slot_valid map.
+
+  ; Restore AX (the block offset) but also save BX, as it has a pointer
+  ; into the packet that we might need again.
+  pop    ax
+  push   bx
+
+  ; Figure out which byte of ra_slot_valid to get and load it into BX
+  mov    cx, ax
+  shr    cx, 1
+  shr    cx, 1
+  shr    cx, 1
+  mov    bx, OFFSET ra_slot_valid
+  add    bx, cx
+
+  ; Isolate the bit in AX
+  and    ax, 0x7
+  mov    cx, ax
+  mov    ax, 1
+  shl    ax, cl
+  or     byte ptr [bx], al
+
+  pop    bx
+
+
+  ; Loop around again
+  inc    ra_receive_index
+  mov    ax, ra_receive_index
+  cmp    ax, [bx].pkt_nd_count
+  jb     receive_ReadAhead1
+
+  ; We are done!
+  receive_ReadAhead_exit:
+  ret
+
+receive_ReadAhead endp
+
+
+
+receive_send_downstream proc near
+
+  ; Find the handle that will handle this, if there is one.
+  mov    si, incoming_buf_p              ; Get the EtherType
+  mov    dx, [si].pkt_arp_eth_type
+  mov    bx, OFFSET handles              ; Search starts at slot 0.
+
+  receive_handle_search_top:
+
+    cmp   [bx].handle_in_use, 0
+    je    receive_handle_check_next
+
+    ; If the handle is in use and it matches either the exact EtherType passed
+    ; in or the catch-all value, then return with bx pointing at the handle.
+    cmp   [bx].handle_type, 0
+    je    receive_handle_found
+    cmp   [bx].handle_type, dx
+    je    receive_handle_found
+
+    receive_handle_check_next:
+
+    ; This slot is not in use or there is no match.  Advance to the next slot.
+    ; If there is no next slot, set the carry flag.
+
+    add   bx, size handle_rec
+    cmp   bx, OFFSET end_handles
+    jb    receive_handle_search_top
+
+    ; Ran out of entries to search.  Early return.
+    ret
+
+
+  receive_handle_found:
+
+  ; First call; tell them the length.  Protect BX because it is critical to us.
+  push   bx
+  mov    ax, 0
+  mov    cx, incoming_pkt_len
+  call   [bx].receiver
+  pop    bx
+
+  ; If they passed back ES:DI == 0:0 we are done.
+  mov    ax, es
+  or     ax, di
+  jz     receive_send_downstream_exit
+
+  receive_copy_for_downstream:
+
+  ; Save ES:DI (their buffer) for later when we have to return it in DS:SI.
+  push   es
+  push   di
+
+  ; Source is our packet (DS:SI).  DS is already set.
+  mov    si, incoming_buf_p
+
+  ; Setup for moving a word at a time.  Preserve CX so we can see if
+  ; there is an odd byte to move.
+  mov    cx, incoming_pkt_len          ; Paranoid, but safe - they might have touched CX.
+  push   cx
+  shr    cx, 1
+  rep    movsw
+  pop    cx
+  and    cx, 1
+  jz     receive_downstream_copy_done
+  movsb
+
+  receive_downstream_copy_done:
+
+  mov    ax, 1
+  mov    cx, incoming_pkt_len
+  pop    si                            ; The user expects their es:di in ds:si now.
+  pop    ds
+  call   cs:[bx].receiver
+
+
+  receive_send_downstream_exit:
+  ret
+
+receive_send_downstream endp
+
+
+
+
+
+; ============================================================================
+;
 
 ifdef CHKSUM_TESTING
 
@@ -1456,24 +2210,32 @@ endif
 ;
 ; When checking a packet the value computed here should be 0.
 ;
-; Inputs:
-;   SI has an offset to the packet start.  (The Eth header.)
+
+
+
+; computeIpChecksum
 ;
-; Outputs:
-;   AX returns the IP checksum
+; Usually IP headers are just 20 bytes, but who knows if something set an
+; IP header option somewhere.  So be smart and use the actual length from
+; the IP header to determine the length of it.
 ;
-; BX and CX are destroyed, DX is untouched.
+; Input:
+;   DS:SI has an offset to the packet start.  (The Eth header.)
+;
+; Output:
+;   AX returns the checksum
+;   DX is untouched.  Make sure DX stays untouched.
+;
+; BX and CX are destroyed.
 
 
 computeIpChecksum proc near
 
        ; Skip to the start of the IP header.
-       add   si, Eth_hdr_len
+       add   si, ETH_HDR_LEN
 
-       ; Get the length of the IP header in 32 bit words.  This code moves
-       ; two bytes when it just needs to move one, but the AND operation
-       ; will clear the upper byte fixing that.
-       mov   cx, word ptr [si]
+       ; Extract the length nibble from the IP header.
+       mov   cl, byte ptr [si]
        and   cx, 0x0f
 
        ; Clear the carry bit and result register.
@@ -1497,7 +2259,28 @@ computeIpChecksum proc near
 computeIpChecksum endp
 
 
+
+; computeUdpChecksum
+;
+; Compute the UDP checksum for a packet, which includes the IP pseudo-header.
+; This implies that you can not call this until the IP and UDP headers of the
+; packet are populated.
+;
+; Options in the IP header will be properly skipped.
+;
+; Input:
+;   DS:SI points to the start of an incoming our outgoing packet.
+;   AX is 0 or a partial checksum.  (If 0, the UDP header and payload is
+;      checksummed in this routine.  It not 0, we assume that portion was
+;      already checksummed and the partial result is in AX.)
+;
+; Output:
+;   AX has the final UDP checksum.
+;   DX is untouched.  Make sure DX stays untouched.
+
 computeUdpChecksum proc near
+
+       push  ax
 
        ; Clear the carry bit.
        clc
@@ -1521,14 +2304,14 @@ computeUdpChecksum proc near
        ; Next the protocol and the byte of 0's.  We already know it is
        ; UDP otherwise we wouldn't be here.
        xor   al, al
-       mov   ah, Ip_Udp_protocol
+       mov   ah, IP_UDP_PROTOCOL
        add   bx, ax
        adc   bx, 0     ; Capture any extra carry
 
        ; Compute where the UDP header starts so that we can get the length
        ; field from it.
        pop   si
-       add   si, Eth_hdr_len
+       add   si, ETH_HDR_LEN
 
        ; Get the length of the IP header in bytes.
        xor   ax, ax
@@ -1540,88 +2323,54 @@ computeUdpChecksum proc near
        ; Add the length of the IP header to get to the start of the UDP header.
        add   si, ax
 
-       ; Add the OFFSET to the UDP header length
+       ; Load the length field from the UDP header.
        mov   ax, [si+pkt_udp_len]
        add   bx, ax
        adc   bx, 0     ; Capture any extra carry
 
-       ; AX has a byte swapped UDP length.  Move it to CX and swap the bytes
-       ; so that we get an actual length.  Also save it so we can do the
-       ; even/odd check at the end.
+       ; At this point you are done with the pseudo-header.
+
+
+       ; AX has a byte swapped UDP length.  Move it CX and swap the bytes to get
+       ; the actual length.  Then subtract 8 so that we get the payload length
+       ; and save it in CX.
        mov   cx, ax
        xchg  cl, ch
-       push  cx
 
 
-       ; Loop over the UDP header and data.  SI points at the UDP header
-       ; and CX has the length of the UDP packet in bytes.  We are doing
-       ; words at a time loop unrolling 8x.
+       ; Checksum the 8 bytes of the UDP header, then subtract its length from CX.
 
-       shr   cx, 1  ; # of words
-       shr   cx, 1
-       shr   cx, 1
-       shr   cx, 1  ; Divided by 8.
+       clc
 
-       ; Skip the loop unrolled part if there is not enough data.
-       jcxz  computeUdpChecksum_2
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       adc   bx, 0
 
-       clc        ; Clear the carry bit in case it was set during this ptr math
+       sub   cx, 8
+       clc
+
+
+       ; If we were provided a partial checksum on entry skip scanning the UDP payload.
+       ; Otherwise, continue checksumming through the UDP payload.
+       pop   ax
+       cmp   ax, 0
+       jnz   computeUdpChecksum_1
+
+       ; On entry BX and CX are already set up for us.  On return AX will have
+       ; the cumulative checksum so clear BX or we'll wind up applying it twice.
+       call  computeUdpDataChecksum
+       xor   bx, bx 
 
        computeUdpChecksum_1:
-       lodsw
        adc   bx, ax
-       lodsw
-       adc   bx, ax
-       lodsw
-       adc   bx, ax
-       lodsw
-       adc   bx, ax
-       lodsw
-       adc   bx, ax
-       lodsw
-       adc   bx, ax
-       lodsw
-       adc   bx, ax
-       lodsw
-       adc   bx, ax
-       loop  computeUdpChecksum_1
-
-       adc   bx, 0     ; Capture any extra carry
-
-       computeUdpChecksum_2:
-       ; Any words left to do?
-       pop   cx
-       push  cx
-
-       shr   cx, 1
-       and   cx, 7
-       jz    computeUdpChecksum_4
-
-       ; Checksum up to 7 words
-       clc
-       computeUdpChecksum_3:
-       lodsw
-       adc   bx, ax
-       loop  computeUdpChecksum_3
-
-       adc   bx, 0     ; Capture any extra carry
-
-       computeUdpChecksum_4:
-       ; Check if we have an odd byte ...
-       pop   cx
-       and   cx, 1
-       jz    computeUdpChecksum_not_odd
-
-       clc
+       adc   bx, 0
        
-       lodsw
-       xor   ah, ah
-       add   bx, ax
-
-       adc   bx, 0     ; Capture any extra carry
-
-       computeUdpChecksum_not_odd:
-
        not   bx
        mov   ax, bx
 
@@ -1631,20 +2380,121 @@ computeUdpChecksum endp
 
 
 
-; On entry DX contains the length of the UDP payload, not counting the UDP
-; header.  The caller has already copied the payload to the outgoing_buf
-; packet for us.
+
+; Compute a partial checksum over only the user data.
 ;
-; No registers are preserved.
+; Input:
+;   BX is a partial checksum or is 0
+;   DS:SI points at the user data.
+;   CX is the length of the user data.
+;
+; Output:
+;   AX has the new partial checksum
+;   DX is untouched.  Make sure DX stays untouched.
 
-sendUDP proc near
+computeUdpDataChecksum proc near
 
-       ; IP Header
+       ; Save cx for later use.
+       push  cx
 
-       ; We are using MOVSW so source is in DS:SI, target is in ES:DI.
+       ; We loop a word at at time.  Loop unroll 8x for better performance.
+       shr   cx, 1  ; # of words
+       shr   cx, 1
+       shr   cx, 1
+       shr   cx, 1  ; Divided by 8.
 
-       mov   di, OFFSET outgoing_buf.out_pkt_start  ; Set the target (ES:DI)
+       ; Skip the loop unrolled part if there is not enough data.
+       jcxz  computeUdpDataChecksum_2
 
+       clc        ; Clear the carry bit in case it was set during this ptr math
+
+       computeUdpDataChecksum_1:
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       lodsw
+       adc   bx, ax
+       loop  computeUdpDataChecksum_1
+
+       adc   bx, 0     ; Capture any extra carry
+
+       computeUdpDataChecksum_2:
+       ; Any words left to do?
+       pop   cx
+       push  cx
+
+       shr   cx, 1
+       and   cx, 7
+       jz    computeUdpDataChecksum_4
+
+       ; Checksum up to 7 words
+       clc
+       computeUdpDataChecksum_3:
+       lodsw
+       adc   bx, ax
+       loop  computeUdpDataChecksum_3
+
+       adc   bx, 0     ; Capture any extra carry
+
+       computeUdpDataChecksum_4:
+       ; Check if we have an odd byte ...
+       pop   cx
+       and   cx, 1
+       jz    computeUdpDataChecksum_not_odd
+
+       clc
+       
+       lodsw
+       xor   ah, ah
+       add   bx, ax
+
+       adc   bx, 0     ; Capture any extra carry
+
+       computeUdpDataChecksum_not_odd:
+
+       mov   ax, bx
+       ret
+
+computeUdpDataChecksum endp
+
+
+
+
+
+
+; setEthIpHeaders
+;
+; Sets the Ethernet and IP headers for the outgoing packet.
+;
+; Input:
+;   BX = IP flags and Fragment offset field, precomputed by the caller.
+;   DX = payload length.  (UDP data and UDP header, if present in this packet.)
+;        DX is not altered because it will needed by the caller again shortly.
+;
+; Output:
+;   DX (the incoming payload length) is untouched.  Make sure DX stays untouched.
+;
+; Side effects:
+;   This always writes to our one outgoing packet.
+
+setEthIpHeaders proc near
+
+       ; we are going to use movsw and stosw and walk through the packet in
+       ; order.  Source data is in DS:SI and the target is in ES:DI.
+
+
+       mov   di, outgoing_buf_p              ; Set the target (ES:DI)
        mov   si, curr_unit                   ; Copy next hop MAC to Ethernet dest
        add   si, unit_next_hop_mac
        movsw
@@ -1656,23 +2506,32 @@ sendUDP proc near
        movsw
        movsw
 
-       mov   ax, Eth_Type_Ip                 ; EthType
+       mov   ax, ETH_TYPE_IP                 ; EthType
        stosw
+
+
+       ; Ip Header
 
        mov   ax, 0x0045                      ; IP Vers/Hlen and Service type (byte swapped)
        stosw
 
-       mov   ax, dx                          ; DX has the UDP payload length
-       add   ax, 0x1C                        ; Add IP Header and UDP header to the payload length
+       mov   ax, dx                          ; DX has the payload length
+       add   ax, IP_HDR_LEN                  ; Add IP Header to the payload length
        xchg  al, ah                          ; Byteswap because network byte order
        stosw
 
-       inc   ip_ident                        ; Increment ident because this is a new packet.
-       mov   ax, ip_ident                    ; Also byte swapped.
+       ; Ident field handling.  Byte-swap and write it, then increment only if
+       ; the more fragments field is set to 0.
+       mov   ax, ip_ident
        xchg  al, ah
        stosw
+       test  bx, IP_HDR_MOREFRAGS
+       jnz   skip_ident_increment
+       inc   ip_ident                        ; Increment ident because this is a new packet.
+       skip_ident_increment:
 
-       mov   ax, 0x0040                      ; Flags and fragment offset: don't fragment (byte swapped)
+       xchg  bh, bl                          ; Byteswap and write the flags and fragment offset word
+       mov   ax, bx
        stosw
        
        mov   ax, 0x11FF                      ; Protocol and TTL (255) (byte swapped)
@@ -1690,12 +2549,50 @@ sendUDP proc near
        movsw
        movsw
 
+       ; Compute the IP header checksum.
+
+       mov   si, outgoing_buf_p
+       call  computeIpChecksum
+       mov   si, outgoing_buf_p
+       mov   [si].pkt_ip_chksum, ax
+
+       ret
+
+setEthIpHeaders endp
+
+
+
+
+; setUdpHeader
+;
+; Sets the fields of the UDP header, including doing the checksum caclulation.
+;
+; Only call this when sending a packet with a UDP header.  You will not call
+; this when sending an IP fragment.
+;
+; Input:
+;   DX is the payload length, including the UDP header.
+;   AX is a partial UDP checksum from the UDP payload, or 0.  (Set to 0
+;      if you want the UDP payload checksummed as part of this processing.)
+;
+; Output:
+;   DX (the incoming payload length) is untouched.  Make sure DX stays untouched.
+
+setUdpHeader proc near
+
+       push  ax                              ; Save AX for later
+
+       mov   bx, outgoing_buf_p
+       lea   di, [bx].out_udp_start          ; Set the target (ES:DI)
 
        ; UDP Header - source port, target port, length and checksum fields.
 
        mov   ax, shared_data.net_my_port     ; Byte swapped source port
        xchg  al, ah
        stosw
+
+       mov   si, curr_unit
+       add   si, OFFSET unit_server_port     ; Set the source (DS:SI)
 
        ; si is pointing at unit_server_port (which is byte swaped)
        lodsw
@@ -1706,54 +2603,73 @@ sendUDP proc near
        ; swapped version in the UDP header.  Save the unswapped version
        ; for later in DX.
 
-       add   dx, 8                           ; Add UDP header length to payload length
        mov   ax, dx
        xchg  al, ah                          ; Byte swap the length to store in the header.
        stosw
 
-       ; Set the UDP checksum to zero for now.  We call the checksum routine soon.
+       ; Set the UDP checksum to zero for now.
        xor   ax, ax
        stosw
 
+       ; Compute the UDP checksum.
 
-       ; Ok, at this point the packet is formed.  Now we need to compute the checksums.
-
-       mov  si, OFFSET outgoing_buf
-       call computeIpChecksum
-       mov  outgoing_buf.pkt_ip_chksum, ax
-
-       ; computeUdpCheck is used for both incoming checking and sending.  It doesn't
-       ; have the logic to look for 0x0000 and change it to 0xFFFF because that would
-       ; be incorrect when the incoming checksum is set and you need to check it.
-       ; Do that check here.
-
-       mov   si, OFFSET outgoing_buf
+       ; If AX had a partial checksum, computeUdpChecksum will use it.  If it was 0 then it
+       ; is harmless.  No need to set the length, computeUdpChecksum will get it from the
+       ; UDP header in the packet.
+       mov   si, outgoing_buf_p
+       pop   ax
        call  computeUdpChecksum
+
+       ; If we came up with a zero for the checksum then change it to 0xFFFF so that
+       ; the other side knows we did the work, and that we didn't just ignore setting
+       ; the checksum value.  (computeUdpChecksum does not do this step because it is
+       ; used both on the send path to compute a checksum and on the receive path to
+       ; validate a checksum.)
+
        cmp   ax, 0
-       jnz   sendUdpChksum1
+       jnz   setUdpHeader1
        mov   ax, 0xFFFF
 
-       sendUdpChksum1:
-       mov   outgoing_buf.out_udp_start.pkt_udp_chksum, ax
+       setUdpHeader1:
+       mov   si, outgoing_buf_p
+       mov   [si].out_udp_start.pkt_udp_chksum, ax
 
+       ret
+
+setUdpHeader endp
+
+
+
+; sendPacket
+;
+; Calls the packet driver to send the formed packet on the wire.
+;
+; Input:
+;   CX = total packet length, including Eth, IP and UDP headers.
+
+sendPacket_di  dw ?                          ; Local variable for sendPacket: delayIncrement
+sendPktCounter dw 0                          ; How many good sends have we had in a row?
+
+sendPacket proc near
+
+       ; On a send error we will increment the sendPckDelay by this amount.
+       mov   sendPacket_di, 1
 
        ; Sending a packet:
        ;   AH = 4, CX = len (min 60), DS:SI = packet addr (DS already set)
 
        mov   sendAttempts, 5 
 
-       sendUDP_send_packet:
+       sendPacket_top:
        mov   ah, 4
-       mov   cx, dx                          ; User buffer length from above, includes UDP header.
-       add   cx, 0x22                        ; Add length of the Eth header and IP headers.
 
        ; Runt packet?
-       cmp   cx, 0x3c                        ; Min packet size is 60 bytes
-       jge   sendUDPNotRunt                  ; If greater than or equal proceed.
-       mov   cx, 0x3c
+       cmp   cx, ETH_FRAME_MIN               ; Min packet size is 60 bytes
+       jae   sendPacketNotRunt               ; If greater than or equal proceed.
+       mov   cx, ETH_FRAME_MIN
 
-       sendUDPNotRunt:
-       mov   si, OFFSET outgoing_buf.out_pkt_start
+       sendPacketNotRunt:
+       mov   si, outgoing_buf_p
 
        ; Push dx and pop it because the driver will communicate an error code in dh,
        ; and we need dx preserved for the UDP packet length.
@@ -1762,32 +2678,141 @@ sendUDP proc near
        call  doPacketInterrupt
        pop   dx
 
-       jnc   sendUDP_end
+       jnc   sendPacket_end
 
-       ; Carry flag was set so the packet driver is not happy.  Retry the send.
+       ; Carry flag was set so the packet driver is not happy.
        ;
-       ; Kill some time to give the hardware a chance to change state.
-       ; On slow machines it is at least 6ms.
+       ; First, assume it is not happy because we are sending packets to it too quickly.
+       ; Each time this happens increment net_pkt_send_dly, until it hits a max.  Do this only
+       ; once per failure.
+       ;
+       ; Then just do a fixed 10ms delay before trying again.
 
-       mov   cx,0x8000
-       sendUDP_delay_loop:
-       loop  sendUDP_delay_loop
+       cmp   shared_data.net_user_send_dly, 0xffff  ; User forced a number; do not alter it.
+       jne   sendPacket_1
+
+       cmp   shared_data.net_pkt_send_dly, 160 ; Max send penalty should never go above 10ms.
+       jae   sendPacket_1
+       mov   ax, sendPacket_di
+       add   shared_data.net_pkt_send_dly, ax
+       mov   sendPacket_di, 0                  ; Set this to zero so we don't bump it again on this particular packet.
+
+       sendPacket_1:
+       mov   delayParm, 160
+       call  delay
 
        add   word ptr shared_data.net_c_send_errs, 1
        adc   word ptr shared_data.net_c_send_errs+2, 0
        dec   sendAttempts
        cmp   sendAttempts, 0
-       jnz   sendUDP_send_packet
+       jnz   sendPacket_top
 
        ; If we run out of attempts just fall through and return.
        ; Eventually a timeout will cause a retry.
 
-       sendUDP_end:
+       sendPacket_end:
+
+       ; If this was a clean send (no retries) and the net_pkt_send_dly is not
+       ; fixed then try an experiment where we reduce the delay.  At worst
+       ; case it will fail and we put it back up again.  This keeps it from
+       ; degrading to the worst case without ever recovering.
+
+       cmp   shared_data.net_pkt_send_dly, 0   ; Running fine, can't reduce the delay.
+       je    sendPacket_end1
+       cmp   sendPacket_di, 0                  ; This specific send failed, so skip the experiment.
+       je    sendPacket_end1
+       cmp   shared_data.net_user_send_dly, 0xffff  ; User forced a number; do not alter it.
+       jne   sendPacket_end1
+
+       inc   sendPktCounter
+       cmp   sendPktCounter, 200               ; Less than 200 successful sends, do nothing.
+       jb    sendPacket_end1
+       mov   sendPktCounter, 0
+       dec   shared_data.net_pkt_send_dly      ; Ok, see if things have improved.
+
+       sendPacket_end1:
        ret
 
+sendPacket endp
 
 
-sendUDP endp
+; delay
+;
+; Sometimes we need a short delay that is less than a BIOS timer tick.  We'll
+; do that by reading the 8253 directly.
+;
+; NetDrive.exe does the work to figure out if channel 0 of the 8253 is in
+; mode 2 or mode 3, and it sets a delay constant for us.  That delay constant
+; is 1/10th of a millisecond.
+;
+; Call this routine by setting delayParm to some number of 1/10th millisecond
+; increments to wait.
+;
+; On a slow system each iteration of the loop will take around 120 clock cycles,
+; which at 4.77Mhz is around 25 microseconds  Our minimum delay is 62 microseconds
+; (1/10th ms) so we can get through this code ; with one or two spins through the
+; loop even on a slow system.  On faster systems it will be much quicker.
+
+TIMER_CONTROL_PORT     equ 0x43
+TIMER_CH0_DATA_PORT    equ 0x40
+
+delay proc near
+
+  cmp   delayParm, 0
+  je    delay_early_exit
+
+  delay_1:
+
+  push  ax
+  push  di
+  push  si
+
+  ; Latch and read the counter
+  pushf
+  cli
+  xor   al, al
+  out   TIMER_CONTROL_PORT, al
+  in    al, 0x61
+  in    al, TIMER_CH0_DATA_PORT
+  xchg  al, ah
+  in    al, 0x61
+  in    al, TIMER_CH0_DATA_PORT
+  popf
+  xchg  al, ah
+
+  mov   di, ax
+
+  delay_loop:
+
+    ; Latch and read the counter
+    pushf
+    cli
+    xor   al, al
+    out   TIMER_CONTROL_PORT, al
+    in    al, 0x61
+    in    al, TIMER_CH0_DATA_PORT
+    xchg  al, ah
+    in    al, 0x61
+    in    al, TIMER_CH0_DATA_PORT
+    popf
+    xchg  al, ah
+
+    mov   si, di
+    sub   si, ax
+    cmp   si, shared_data.net_one_10th_ms
+    jb    delay_loop
+
+    dec   delayParm
+    jnz   delay_loop
+
+  pop   si
+  pop   di
+  pop   ax
+
+  delay_early_exit:
+  ret
+
+delay endp
 
 
 
@@ -1813,6 +2838,9 @@ sendUDP endp
 
 timerInt proc far
 
+  ; This pushf is here so that the thing that we call can do an IRET to
+  ; return, as it expects.  (Our normal pattern is to pushf, change a flag
+  ; and then popf later ... you won't see that here.)
   pushf
   call   cs:[timerOrigInt]
 
@@ -1856,14 +2884,15 @@ timerInt proc far
 
   jnc    timerInt_packet_sent
 
-  ; Carry flag was set so the packet driver is not happy.  Retry the send.
-  ;
-  ; Introduce a small delay here to give the hardware time to recover.
-  ; This should be rare so don't worry about the timer interrupt too much.
+  ; Carry flag was set so the packet driver is not happy.
 
-  mov    cx,0x8000
-  timerInt_delay_loop:
-  loop timerInt_delay_loop
+  ; Retry the send.  This should rarely happen in while we are under
+  ; the timer interrupt.  The delay here won't screw up the timer ticks
+  ; because ints are usually still enabled while we are spinning.
+
+  timerInt_delay:
+  mov    delayParm, 160
+  call   delay
 
   add    word ptr shared_data.net_c_send_errs, 1
   adc    word ptr shared_data.net_c_send_errs+2, 0
@@ -1915,140 +2944,341 @@ doPacketInterrupt endp
 
 
 
+; ============================================================================
+;
 ; Our lightweight packet driver ...
 ;
-; The intent here is to implement enough packet driver functions to make
-; the existing mTCP programs run correctly.  The limitations are listed
-; ahead of each function.
+; Aside from possible bugs, this looks and behaves like a packet driver.
+; All packets not explicitly processed by the main driver will be passed here,
+; including ARP and broadcast traffic.  Downstream programs should not be
+; able to detect that they are being filtered.
 
-shimName db "mTCP NetDrive", 0
+even
 
-shimInt proc far
+function_table label word
+  dw  f_not_implemented     ;0
+  dw  f_driver_info         ;1
+  dw  f_access_type         ;2
+  dw  f_release_type        ;3
+  dw  f_send_pkt            ;4
+  dw  f_terminate           ;5
+  dw  f_get_address         ;6
+  dw  f_reset_interface     ;7
 
-  jmp  shimInt_branchtable
+
+driver_name db "mTCP NetDrive", 0
+
+
+soft_int_dispatcher:
+
+  jmp short soft_int_dispatcher_start
   nop
+  db               "PKT DRVR", 0
 
-  db   "PKT DRVR"
+  soft_int_dispatcher_start:
+
+  push  ax
+  push  bx
+  push  cx
+  push  dx
+  push  si
+  push  di
+  push  bp
+  push  ds
+  push  es
+
+  ; Use BP to access the caller's register values.
+  mov   bp, sp
+
+  ; Re-establish our data segment
+  mov   ax, cs
+  mov   ds, ax
+
+  ; Assume things will work
+  and   p_FLAGS[bp], not CARRY_BIT
+
+  ; The function number is in AH.  Isolate it in AL and use it with the
+  ; function table to make the call.  If the function number is above what
+  ; we support set it to f_not_implemented.
+
+  xor   ax, ax
+  mov   al, p_AH[bp]
+  cmp   al, call_reset                   ; f_reset_interface
+  jbe   soft_int_dispatcher_make_call
+
+  mov   al, 0                            ; f_not_implemented
+
+  soft_int_dispatcher_make_call:
+  add   ax, ax
+  mov   di, OFFSET function_table
+  add   di, ax
+  call  word ptr[di]
+  jnc   soft_int_dispatcher_exit
+
+  ; If the function returned an error stuff the error code in the saved regs
+  ; and set the carry flag.
+  ;
+  mov   p_DH[bp], dh
+  or    p_FLAGS[bp], CARRY_BIT
+
+  soft_int_dispatcher_exit:
+
+  pop   es
+  pop   ds
+  pop   bp
+  pop   di
+  pop   si
+  pop   dx
+  pop   cx
+  pop   bx
+  pop   ax
+
+  iret
 
 
-  ; Don't bother converting this to a real branch table; we don't want to
-  ; touch any registers that might have parameters in them.  Put the check
-  ; for send first for performance reasons, as it is most likely to be used.
+f_not_implemented proc near
+  return_with_error err_BAD_COMMAND
+f_not_implemented endp
 
-  shimInt_branchtable:
 
-  cmp  ah, 4
-  jz   shimInt_send
-  cmp  ah, 1
-  jz   shimInt_driverInfo
-  cmp  ah, 2
-  jz   shimInt_accesstype
-  cmp  ah, 3
-  jz   shimInt_releasetype
-  cmp  ah, 6
-  jz   shimInt_getmac
-  cmp  ah, 7
-  jz   shimInt_reset
+verify_handle proc near
 
-  ; Anything else ...
-  mov  dh, 11                 ; BAD_COMMAND
+  mov   bx, p_BX[bp]                     ;get the handle they gave us
+  cmp   bx, OFFSET handles
+  jb    verify_handle_bad                ;no - must be bad.
+  cmp   bx, OFFSET end_handles
+  jae   verify_handle_bad                ;no - must be bad.
+  cmp   [bx].handle_in_use, 1            ;if it's not in use, it's bad.
+  jne   verify_handle_bad
+  ret
+
+  verify_handle_bad:
+  mov   dh, ERR_BAD_HANDLE
+  add   sp, 2                            ;pop off our return address.
   stc
-  jmp  shimInt_exit
+  ret
+
+verify_handle endp
 
 
-  shimInt_driverInfo:
+f_driver_info proc near
 
-  mov  bx, 1                  ; Shim version
-  mov  cx, 0x0100             ; ch = Class (type 1 Ethernet), cl = interface number (0)
-  mov  dx, 240                ; Type  (Made up ...)
-  mov  ax, cs                 ; Nul terminated driver name
-  mov  ds, ax
-  mov  si, OFFSET shimName
-  mov  al, 1                  ; Basic functions only.
-  clc
-  jmp  shimInt_exit
+  ; Do not verify the handle - it doesn't make sense and it's not required now.
 
+  ; Enforce that AL was set correctly, but it doesn't have an associated
+  ; return code so just set the carry flag if it is incorrect.  (DH would
+  ; normally be modified; do not do that in this case.)
 
-  shimInt_accesstype:
+  cmp   p_AL[bp], 0xff
+  je    f_driver_info_1
+  return_with_error dh
 
-  ; Only Class 1 (Ethernet) should be calling here so we don't try to
-  ; match the requested Class or Type.  Interface 0 is the only option
-  ; so don't bother checking that either.  And mTCP always asks for
-  ; the wildcard Ethernet type so don't bother matching those; we're
-  ; going to pass every packet through.  (And it only uses accesstype
-  ; once, so the NO_SPACE error is not an option for us.)
+  f_driver_info_1:
+  mov   p_BX[bp], 1                      ; Version
+  mov   p_CH[bp], 1                      ; Class (Ethernet)
+  mov   p_CL[bp], 0x0                    ; Interface number
+  mov   p_DX[bp], 0xff                   ; Type (doesn't matter)
+  mov   p_DS[bp], cs                     ; Segment and offset to driver_name
+  mov   p_SI[bp], OFFSET driver_name
+  mov   p_AL[bp], 0x1                    ; Basic functions only
+  ret
 
-  ; Save their receiver function and give them a bogus handle to use.
-  mov  word ptr cs:theirReceiver, di
-  mov  word ptr cs:theirReceiver+2, es
-  mov  ax, 1234
-  clc
-  jmp  shimInt_exit
+f_driver_info endp
 
 
-  shimInt_releasetype:
+f_access_type proc near
 
-  ; Always disconnects and never fails.  It doesn't bother checking the handle;
-  ; mTCP programs always use just one handle so checking it is not needed.
+  ; Class has to match.  We are doing DIX for now and maybe 802.3 later.
+  cmp   p_AL[bp], 1
+  jne   f_access_type_no_class
 
-  mov  word ptr cs:theirReceiver, 0
-  mov  word ptr cs:theirReceiver+2, 0
-  clc
-  jmp  shimInt_exit
+  ; Type must match the generic type; there was no type definition for DaynaPORT
+  cmp   p_BX[bp], 0xffff
+  jne   f_access_type_no_type
 
-
-  shimInt_send:
-
-  ; If the packet driver sets the CF flag we'll pass it through on return.
-
-  call doPacketInterrupt
-  jmp  shimInt_exit
+  ; Interface number must always be 0 (the first interface)
+  cmp   p_DL[bp], 0
+  jne   f_access_type_no_number
 
 
-  shimInt_getmac:
+  ; Find an open handle.
+  ;
+  ; If they said "any packet" (typelen - 0) then always use the last slot
+  ; in the handle table for that.  That makes it serve as a catch-all for
+  ; any EtherType not explicitly claimed.
+  ;
+  ; For any other EtherType the entire table has to be searched to ensure
+  ; it has not already been claimed.
+
+  mov   handle_found, 0
+
+  cmp   p_CX[bp], 0
+  je    f_access_type_start_searching_at_end
+
+  ; DX will have the requested EtherType in it and we will search the entire table.
+  mov   es, p_DS[bp]
+  mov   di, p_SI[bp]
+  mov   dx, es:[di]
+
+  mov   bx, OFFSET handles
+  jmp   f_access_type_handle_search_top
+
+  f_access_type_start_searching_at_end:
+  ; Ethertype is "0" and we only search the last slot.
+  mov   dx, 0
+  mov   bx, OFFSET end_handles - (size handle_rec)
+
+  f_access_type_handle_search_top:
+
+    cmp   [bx].handle_in_use, 0          ; Not in use; note that we can use this.
+    je    f_access_type_open_handle
+
+    mov   ax, [bx].handle_type           ; Slot is used; if same EtherType we are done.
+    cmp   ax, dx
+    je    f_access_type_type_in_use
+
+    jmp   f_access_type_move_to_next_slot
+
+    f_access_type_open_handle:
+    ; Only mark the open handle if we have not found one already.
+    cmp   handle_found, 0
+    jne   f_access_type_move_to_next_slot
+
+    mov   handle_found, bx
+
+    f_access_type_move_to_next_slot:
+    add   bx, size handle_rec
+    cmp   bx, OFFSET end_handles
+    jne   f_access_type_handle_search_top
+
+
+  ; If you made it here the EtherType was not in use.  (And if it was the
+  ; catch-all type, that is not in use either.)
+
+  cmp   handle_found, 0
+  je    f_access_type_no_space
+
+  mov   bx, handle_found
+  mov   [bx].handle_in_use, 1
+  mov   [bx].handle_type, dx
+  mov   ax, p_DI[bp]
+  mov   word ptr [bx].receiver, ax
+  mov   ax, p_ES[bp]
+  mov   word ptr [bx].receiver+2, ax
+  inc   handles_in_use
+
+  mov   p_AX[bp], bx
+  ret
+
+
+  f_access_type_no_class:
+  return_with_error ERR_NO_CLASS
+  f_access_type_no_type:
+  return_with_error ERR_NO_TYPE
+  f_access_type_no_number:
+  return_with_error ERR_NO_NUMBER
+  f_access_type_no_space:
+  return_with_error ERR_NO_SPACE
+  f_access_type_type_in_use:
+  return_with_error ERR_TYPE_IN_USE
+
+f_access_type endp
+
+
+f_release_type proc near
+  call verify_handle                     ; Does not return on failure.
+  mov   [bx].handle_in_use, 0            ; Mark as not in use.
+  dec   handles_in_use
+  ret
+f_release_type endp
+
+
+f_send_pkt proc near
+
+  push  ds
+
+  ; Basically just pass through what they gave us.
+  mov   ah, call_SEND
+  mov   cx, p_CX[bp]
+  mov   si, p_SI[bp]
+  mov   ds, p_DS[bp]
+
+  ; On return if there was an error DH will have an error code and the carry
+  ; flag will be set.
+  call  doPacketInterrupt
+
+  pop   ds
+
+
+  ret
+f_send_pkt endp
+
+
+f_terminate proc near
+
+  ; Terminate is weird in this context, as we are not going to unload or
+  ; unhook anything.  We just mark their handle as released and if there
+  ; are no more handles we claim we are done.
+
+  call verify_handle                     ; Does not return on failure.
+
+  ; Mark this handle as not in use and decrease the number of handles in use.
+  ; If no more handles are in use we can continue and terminate.
+
+  mov   [bx].handle_in_use, 0
+  dec   handles_in_use
+  cmp   handles_in_use, 0
+  jne   f_terminate_cant_terminate
+
+  ret
+
+  f_terminate_cant_terminate:
+  return_with_error ERR_CANT_TERMINATE
+
+f_terminate endp
+
+
+f_get_address proc near
 
   ; This happens rarely so don't optimize it.
   ;
   ; Save their handle (in bx) in case they need it; alter it to the real
   ; handle being used, and then call the packet driver.
 
-  push bx
-  mov  bx, cs:shared_data.net_pkt_drv_hndl
+  mov  ah, call_GET_ADDRESS
+  mov  bx, shared_data.net_pkt_drv_hndl
+  mov  es, p_ES[bp]
+  mov  di, p_DI[bp]
+  mov  dx, p_CX[bp]
+
+  ; On return if there was an error DH will have an error code and the carry
+  ; flag will be set.
   call doPacketInterrupt
-  pop  bx
 
-  clc
-  jmp  shimInt_exit
-
-
-  shimInt_reset:
-  ; mTCP doesn't use this so return an error if something tries.  We can
-  ; add it later if somebody complains.
-  mov  dh, 15            ; CANT_RESET
-  stc
-  jmp  shimInt_exit
+  ret
+f_get_address endp
 
 
-  shimInt_exit:
+f_reset_interface proc near
 
-  ; Based on the state of the Carry Flag, manipulate the saved flags
-  ; word to set the return code for the caller.
+  call  verify_handle                     ; Does not return on failure.
 
-  push bp
-  mov  bp, sp
-  jc   shimInt_cf
-  and  byte ptr [bp+6], 0xfe
-  jmp  shimInt_cf_done
-  shimInt_cf:
-  or   byte ptr [bp+6], 1
-  shimInt_cf_done:
-  pop  bp
+  cmp   handles_in_use, 1
+  ja    f_reset_interface_cant
 
-  iret
-shimInt endp
+  ret
+
+  f_reset_interface_cant:
+  ; Not allowed to pull the rug if other handles are active.
+  return_with_error err_CANT_RESET
+
+f_reset_interface endp
 
 
 
+
+; ============================================================================
+;
 
 ; After the initialization routine runs we are going to reuse the data area
 ; for the per-unit connection data.  This allows us to use exactly the amount
@@ -2086,7 +3316,7 @@ initial proc near
 
   mov   shared_data.net_segment, cs
   mov   shared_data.net_receiver_off, OFFSET receivePacket
-  mov   shared_data.net_shim_off, OFFSET shimInt
+  mov   shared_data.net_shim_off, OFFSET soft_int_dispatcher
   mov   shared_data.net_int_inst_off, OFFSET doPacketInterrupt
 
   ifdef CHKSUM_TESTING
@@ -2111,6 +3341,7 @@ initial proc near
   mov   ax, es:[bx].rh0_bpb_array_off+2
   mov   cursor_seg, ax
 
+  cld
 
   initial_scanswitches_top:
   push  ds                       ; scanswitch alters ds
@@ -2239,6 +3470,16 @@ initial proc near
   mov    cx, ax                          ; Setup count for the rep stosw loop
 
 
+  ; DX has the number of bytes for the unit storage.  Add an offset to the
+  ; unit storage, which then makes it the starting location for the next driver.
+  add    dx, OFFSET units_storage
+
+  ; Record where our incoming and outgoing packet buffers are going to be.
+  mov    incoming_buf_p, dx
+  add    dx, ETH_FRAME_SIZE
+  mov    outgoing_buf_p, dx
+  add    dx, ETH_FRAME_SIZE
+
   ; Restore pointer to request header in ES:BX
   mov    ax, cs:rh_seg
   mov    es, ax
@@ -2254,8 +3495,6 @@ initial proc near
 
 
   ; Set the address to load the next driver at.  After our unit storage.
-
-  add    dx, OFFSET units_storage
   mov    es:[bx].rh0_brk_off, dx
   mov    es:[bx].rh0_brk_seg, cs
 
@@ -2381,7 +3620,7 @@ scanswitch endp
 
 
 
-Hello           db    'mTCP NetDrive (Nov 10 2023) by M Brutman (C) 2023-2025 (www.brutman.com/mTCP)',13,10,'$'
+Hello           db    'mTCP NetDrive (Nov 10 2023) by M Brutman (C) 2023-2026 (www.brutman.com/mTCP)',13,10,'$'
 Hello2_DOS2     db    '  First network drive is (unknown - DOS 2.x detected), ','$'
 Hello2          db    '  First network drive is '
 DriveLetter     db    'X:, ','$'

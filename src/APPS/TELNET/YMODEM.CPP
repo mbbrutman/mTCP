@@ -1,7 +1,7 @@
 /*
 
    mTCP Ymodem.cpp
-   Copyright (C) 2012-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -71,7 +71,7 @@
 
 Transfer_vars transferVars;
 
-char *ExtraFileBuffer = NULL;
+static char *ExtraFileBuffer = NULL;
 
 
 
@@ -186,7 +186,7 @@ static uint16_t xmodem_calcCRC(uint8_t *ptr, int16_t count) {
 
 static uint16_t crcTable[256];
 
-void xmodem_crcInit(void) {
+static void xmodem_crcInit(void) {
 
   uint16_t remainder;
   int      dividend;
@@ -288,9 +288,7 @@ static int8_t transfer_SendByte( uint8_t data ) {
       return 1;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
     
   }
 
@@ -302,9 +300,7 @@ static int8_t transfer_SendByte( uint8_t data ) {
     // If we can not get a transmit buffer then we better start processing
     // some packets!  This should almost never happen.
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     if ( mySocket->isRemoteClosed( ) ) {
       // Whoops.  We are done ...
@@ -316,7 +312,7 @@ static int8_t transfer_SendByte( uint8_t data ) {
 
   // Great.  We have an outgoing buffer and we know we can send it.
   
-  buf->b.dataLen = 1;
+  buf->b.setDataLen( 1 );
   buf->data[0] = data;
 
   if ( mySocket->enqueue( &buf->b ) != 0 ) {
@@ -327,9 +323,7 @@ static int8_t transfer_SendByte( uint8_t data ) {
 
 
   // Push it out!
-
-  PACKET_PROCESS_SINGLE;
-  Tcp::drivePackets( );
+  Utils::processPackets( );
 
   transferVars.bumpTimer( );
 
@@ -340,6 +334,8 @@ static int8_t transfer_SendByte( uint8_t data ) {
 
 static void recvFlush( uint32_t timeoutInMs ) {
 
+  TRACE(( "Ymodem: recvFlush start\n" ));
+
   // Loop for designated amount of time eating any data that arrives on the
   // socket.  If the socket closes the caller needs to detect it.
 
@@ -349,9 +345,7 @@ static void recvFlush( uint32_t timeoutInMs ) {
 
   while ( !remoteDone ) {
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
+    Utils::processPackets( );
 
     // Keep wiping out the recv buffer in case the other side is furiously
     // sending data.
@@ -362,6 +356,8 @@ static void recvFlush( uint32_t timeoutInMs ) {
     remoteDone = mySocket->isRemoteClosed( );
 
   }
+
+  TRACE(( "Ymodem: recvFlush end\n" ));
 
 }
 
@@ -543,15 +539,24 @@ void updateFileMsg( uint8_t attr, char *text ) {
 
 static void endTransfer( bool isErr, bool sendCancels, char *finalMsg ) {
 
+  TRACE(( "Ymodem: end transfer\n" ));
+
   uint8_t attr = scFileXfer;
   if ( isErr ) attr = scErr;
 
   if ( sendCancels ) {
     transfer_SendByte( XMODEM_CAN );
     transfer_SendByte( XMODEM_CAN );
+    transfer_SendByte( XMODEM_CAN );
   }
 
   updateFileMsg( attr, finalMsg );
+
+  // I had this code in place to eat raw binary data that might be confusing
+  // to the user, but in retrospect it is a bad thing to do - we might
+  // accidentally eat Telnet options negotiation bytes while doing this.
+  //
+  // if ( isErr ) recvFlush( 2000 );
 
   if ( transferVars.targetFile != NULL ) {
     fclose( transferVars.targetFile );
@@ -565,7 +570,7 @@ static void endTransfer( bool isErr, bool sendCancels, char *finalMsg ) {
   UserInputMode = UserInputMode_t::Help;
   s.doNotUpdateRealScreen( );
 
-  setTelnetBinaryMode( false );
+  setTelnetBinaryMode( transferVars.localBinaryMode, transferVars.remoteBinaryMode );
 }
 
 
@@ -574,7 +579,7 @@ static void endTransfer( bool isErr, bool sendCancels, char *finalMsg ) {
 
 void Transfer_vars::checkForDownloadTimeout( void ) {
 
-  // Assume 3 seconds is more than enough.  Do we need different timeouts for different states?
+  // Assume 5 seconds is more than enough.  Do we need different timeouts for different states?
 
   if ( Timer_diff( getLastActivity( ), TIMER_GET_CURRENT( ) ) < TIMER_MS_TO_TICKS( 5000 ) ) return;
 
@@ -892,6 +897,11 @@ void processUserInput_Filename( Key_t key ) {
 
   }
 
+  if ( key.action == K_Backspace ) {
+    key.action = K_NormalKey;
+    key.normalKey = 8;
+  }
+
   if ( key.action != K_NormalKey ) return;
 
 
@@ -974,7 +984,8 @@ void Transfer_vars::startDownload( void ) {
     nextExpectedPacketNum = 0;  // Fix me, probably not needed
   }
 
-  setTelnetBinaryMode( true );
+  getTelnetBinaryMode( &transferVars.localBinaryMode, &transferVars.remoteBinaryMode );
+  setTelnetBinaryMode( true, true );
 
   transfer_SendByte( startDownloadBytes[fileProtocol] );
 
@@ -1025,7 +1036,8 @@ void Transfer_vars::startUpload( void ) {
   drawFileStatusWindow( );
   updateFileMsg( scFileXfer, "Waiting for start" );
 
-  setTelnetBinaryMode( true );
+  getTelnetBinaryMode( &transferVars.localBinaryMode, &transferVars.remoteBinaryMode );
+  setTelnetBinaryMode( true, true );
 }
 
 
@@ -1167,12 +1179,19 @@ uint16_t Transfer_vars::processSocket_UploadInternal( uint8_t *recvBuffer, uint1
       }
 
     }
-    else { // Second byte after a TEL_IAC.  Determine how to handle it.
+    else { // Second byte after a TEL_IAC.
 
-      if ( ch == 242 ) { // Data Mark
+      if ( ch == 242 ) {  // Data Mark
+
+        // Do nothing for Telnet Data Mark.  This usually means process anything
+        // of interest to Telnet and discard the rest but we are not dealing with
+        // large amounts of data here so just let all of the data be processed
+        // as is.  I'd rather have the user see some junk on the screen than to miss
+        // a Telnet options negotiation.
+        
         telnetIACSeen = 0;
-        endTransfer( false, false, "Telnet DataMark - done?" );
         return 1;
+
       } 
       else {
 
@@ -1253,7 +1272,7 @@ uint16_t Transfer_vars::processSocket_UploadInternal( uint8_t *recvBuffer, uint1
 
         if ( targetFile == NULL ) {
           // We stated the file already so this should not happen.
-          endTransfer( true, true, "File note found: aborting" );
+          endTransfer( true, true, "File not found: aborting" );
           return len; // Eat all remaining chars
         }
 
@@ -1495,7 +1514,7 @@ void Transfer_vars::sendXmodemPacket( void ) {
   expectedPayloadSize = 128;
   ymodemPacket[0] = XMODEM_SOH;
 
-  TRACE(( "Expected: %lu   Xferred: %lu\n", expectedFilesize, bytesXferred ));
+  TRACE(( "Upload: Expected: %lu, Xferred: %lu\n", expectedFilesize, bytesXferred ));
 
   if ( fileProtocol == Xmodem_1K || fileProtocol == Ymodem || fileProtocol == Ymodem_G ) {
     if ( ((expectedFilesize - bytesXferred) > 1024) && (mySocket->maxEnqueueSize > 1250) ) {
@@ -1618,9 +1637,7 @@ void Transfer_vars::transmitPacket( ) {
 
       // Keep processing packets until we get one of our outgoing buffers freed up.
 
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-      Tcp::drivePackets( );
+      Utils::processPackets( );
 
       if ( mySocket->isRemoteClosed( ) ) {
         // Whoops - we are done
@@ -1639,7 +1656,7 @@ void Transfer_vars::transmitPacket( ) {
       bytesSent++;
     }
 
-    buf->b.dataLen = bufIndex;
+    buf->b.setDataLen( bufIndex );
 
     if ( mySocket->enqueue( &buf->b ) ) {
 
@@ -2028,7 +2045,8 @@ uint16_t Transfer_vars::processSocket_DownloadInternal( uint8_t *recvBuffer, uin
         uint16_t theirCRC = crc1 << 8 | crc2;
 
         if ( myCRC != theirCRC ) {
-          TRACE(( "Download: bad CRC, theirs: %04x  mine: %04x\n", theirCRC, myCRC ));
+          TRACE_WARN(( "Download: bad CRC, theirs: %04x  mine: %04x\n", theirCRC, myCRC ));
+          TRACE_WARN(( "Download: packetNum1: %d\n", packetNum1 ));
           updateFileMsg( scErr, "CRC error" );
           packetError = 1;
           break;

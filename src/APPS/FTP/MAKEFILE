@@ -36,7 +36,10 @@ compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj udp.obj utils.obj dns.obj timer.obj ipasm.obj trace.obj
 objs = ftp.obj
 
-all : clean ftp.exe 
+all : clean ftp.exe
+
+install : .symbolic
+	@copy ftp.exe ..\..\execs
 
 clean : .symbolic
   @del ftp.exe

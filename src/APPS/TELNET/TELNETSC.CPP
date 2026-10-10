@@ -1,7 +1,7 @@
 /*
 
    mTCP TelnetSc.cpp
-   Copyright (C) 2009-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -118,10 +118,10 @@ int8_t Screen::init( uint8_t backScrollPages, uint8_t initialWrapState_p ) {
       // Not MDA or VGA.  If this does not return 0x10 it is an EGA BIOS.
       if ( getEgaMemSize( ) != 0x10 ) {
         cardType = 2; // EGA
+      } else {
+        // Ok, it is a CGA.  Which we already set above.
+        cardType = 1;
       }
-
-      // Ok, it is a CGA.  Which we already set above.
-      cardType = 1;
     }
 
     // We are always using video modes 3 or 6 so this never changes with the card type.
@@ -180,6 +180,22 @@ int8_t Screen::init( uint8_t backScrollPages, uint8_t initialWrapState_p ) {
   resetTerminalState( );
 
   return 0;
+}
+
+
+// Only allow graphics (RLE or SIXEL) if we are on a color card using a
+// standard screen size.  While we can detect and work with other screen
+// sizes, we don't have the code to restore them after going to graphics
+// mode.
+
+bool Screen::graphicsAllowed( void ) {
+
+  if ( (getCardType() > 0) && (terminalCols == 80) &&
+       (terminalLines == 25 || terminalLines == 43 || terminalLines == 50) ) {
+    return true;
+  } else {
+    return false;
+  }
 }
 
 
@@ -652,6 +668,9 @@ void Screen::add( char *buf, uint16_t len ) {
 
       switch ( c ) {
 
+        case 0: // NULL
+          break;
+
         case '\r': { // Carriage return
           cursor_x = 0;
           resetLastColumnFlag();
@@ -691,6 +710,9 @@ void Screen::add( char *buf, uint16_t len ) {
 
           break;
         }
+
+        default:
+          addPrintableChar( c );
 
       } // end switch
 

@@ -1,7 +1,7 @@
 /*
 
    mTCP Keys.h
-   Copyright (C) 2011-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -68,6 +68,7 @@
 #define K_Alt_D           (22)
 #define K_Alt_U           (23)
 #define K_Alt_F           (24)
+#define K_Backspace       (25)
 
 
 typedef struct {
@@ -77,8 +78,8 @@ typedef struct {
   #endif
 
   uint8_t    action;      // From the table above; describes what happened.
-  uint8_t    local;       // Interpreted locally by telnet?
-  uint8_t    normalKey;   // Valid only if action = K_NormalKey or K_Unicode_Char
+  bool       local;       // Interpreted locally by telnet?
+  uint8_t    normalKey;   // ASCII Value: Valid only if action = K_NormalKey or K_Unicode_Char
 
 } Key_t;
 

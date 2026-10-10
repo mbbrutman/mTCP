@@ -1,7 +1,7 @@
 /*
 
    mTCP Sntp.cpp
-   Copyright (C) 2010-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2010-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -133,7 +133,7 @@ bool checkUserExit( void ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP SNTP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2025\n";
+static char CopyrightMsg1[] = "mTCP SNTP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2026\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -199,8 +199,7 @@ int main( int argc, char *argv[] ) {
 
     if ( !Dns::isQueryPending( ) ) break;
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
+    Utils::processPackets( );
     Dns::drivePendingQuery( );
 
   }
@@ -278,8 +277,7 @@ int main( int argc, char *argv[] ) {
         break;
       }
 
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
+      Utils::processPackets( );
 
     }
 
@@ -501,9 +499,7 @@ void continuous( void ) {
       if ( Timer_diff( startTime, TIMER_GET_CURRENT( ) ) > TIMER_MS_TO_TICKS( TimeoutSecs ) ) {
         break;
       }
-      PACKET_PROCESS_SINGLE;
-      Arp::driveArp( );
-
+      Utils::processPackets( );
     }
 
     if ( SntpLib::replyReceived( ) ) {

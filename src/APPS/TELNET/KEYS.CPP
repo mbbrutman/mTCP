@@ -1,7 +1,7 @@
 /*
 
    mTCP Keys.cpp
-   Copyright (C) 2011-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -50,6 +50,43 @@ static uint8_t unicode_len;       // How many hex digits have we read?
 #endif
 
 
+
+// Define a table of scan codes and actions for our commonly used special keys.
+// Put the most commonly used keys first to reduce the overall amount of time
+// spent searching.
+
+typedef struct {
+  uint8_t  scanCode;
+  uint8_t  action;
+  bool     local;
+} FkeyAction_t;
+
+FkeyAction_t fKeys[] = {
+  {72, K_CursorUp,         false},
+  {75, K_CursorLeft,       false},
+  {77, K_CursorRight,      false},
+  {80, K_CursorDown,       false},
+  {73, K_PageUp,           true},
+  {81, K_PageDown,         true},
+  {82, K_Insert,           false},
+  {83, K_Delete,           false},
+  {71, K_Home,             false},
+  {15, K_Backtab,          false},
+  {35, K_Alt_H,            true},    // Help
+  {17, K_Alt_W,            true},    // Wrapping toggle
+  {18, K_Alt_E,            true},    // Local echo
+  {19, K_Alt_R,            true},    // Refresh screen
+  {22, K_Alt_U,            true},    // Upload
+  {32, K_Alt_D,            true},    // Download
+  {33, K_Alt_F,            true},    // Shell to DOS
+  {45, K_Alt_X,            true},    // Exit
+  {48, K_Alt_B,            true},    // Backspace type toggle
+  {49, K_Alt_N,            true},    // Enter type toggle
+  {130, K_Compose_Unicode, true},
+};
+
+
+
 Key_t getKey( void ) {
 
   Key_t rc;
@@ -71,40 +108,20 @@ Key_t getKey( void ) {
 
     uint8_t fkey = c>>8;
 
-    switch ( fkey ) {
-
-      case 15: { rc.action = K_Backtab;     break; }
-      case 17: { rc.action = K_Alt_W;       rc.local = 1; break; }
-      case 18: { rc.action = K_Alt_E;       rc.local = 1; break; }
-      case 19: { rc.action = K_Alt_R;       rc.local = 1; break; }
-      case 22: { rc.action = K_Alt_U;       rc.local = 1; break; }
-      case 32: { rc.action = K_Alt_D;       rc.local = 1; break; }
-      case 33: { rc.action = K_Alt_F;       rc.local = 1; break; }
-      case 35: { rc.action = K_Alt_H;       rc.local = 1; break; }
-      case 45: { rc.action = K_Alt_X;       rc.local = 1; break; }
-      case 48: { rc.action = K_Alt_B;       rc.local = 1; break; }
-      case 49: { rc.action = K_Alt_N;       rc.local = 1; break; }
-      case 71: { rc.action = K_Home;        break; }
-      case 72: { rc.action = K_CursorUp;    break; }
-      case 73: { rc.action = K_PageUp;      rc.local = 1; break; }
-      case 75: { rc.action = K_CursorLeft;  break; }
-      case 77: { rc.action = K_CursorRight; break; }
-      case 80: { rc.action = K_CursorDown;  break; }
-      case 81: { rc.action = K_PageDown;    rc.local = 1; break; }
-      case 82: { rc.action = K_Insert;      break; }
-      case 83: { rc.action = K_Delete;      break; }
-
-      #ifdef TELNET_UNICODE
-      case 130: { // Alt-Minus (-)
-        rc.action = K_Compose_Unicode;
-        rc.local = 1;
-        compose_active = true;
-        unicode_len = 0;
-        break;
+    for ( int i=0; i < sizeof(fKeys)/sizeof(FkeyAction_t); i++ ) {
+      if ( fkey == fKeys[i].scanCode ) {
+        rc.action = fKeys[i].action;
+        rc.local = fKeys[i].local;
       }
-      #endif
-
     }
+
+    #ifdef TELNET_UNICODE
+    // Extra handling for Unicode Compose  Alt-Minus (-)
+    if ( fkey == 130 ) {
+      compose_active = true;
+      unicode_len = 0;
+    }
+    #endif
 
   } else {
 
@@ -146,11 +163,18 @@ Key_t getKey( void ) {
     rc.action = K_NormalKey;
     rc.normalKey = ( c & 0xff );
 
-    // Special enter key processing - we want to be able to tell the
-    // difference between Enter and Ctrl-M.
     if ( rc.normalKey == 13 ) {
+      // Special enter key processing - we want to be able to tell the
+      // difference between Enter and Ctrl-M.
       if ( (c>>8) == 0x1c ) { // This was the Enter key.
         rc.action = K_Enter;
+        rc.normalKey = 0;
+      }
+    } else {
+      // Special backspace key processing - we want to be able to tell the
+      // difference between Backspace and Ctrl-H.
+      if ( (c>>8) == 0x0e ) { // This was the Backspace key.
+        rc.action = K_Backspace;
         rc.normalKey = 0;
       }
     }

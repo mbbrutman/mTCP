@@ -1,7 +1,7 @@
 /*
 
    mTCP Utils.cpp
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -718,36 +718,18 @@ int8_t Utils::initStack( uint8_t tcpSockets,
 
   uint8_t selectedPacketInt = 0;
 
-  if ( packetInt2 ) {
-
-    // A secondary was provided.  If it is active try to connect to it.
-
-    // Normally we could just detect an empty interrupt vector by looking for
-    // zeros, but no, the PCjr makes it more exciting by using F000:F815 which
-    // is basically a no-op routine.  If we see either zeros or F000:F815 then
-    // the vector is not inuse.
-
-    uint16_t far * intCode = (uint16_t far *)MK_FP( 0x0, packetInt2 * 4 );
-
-    bool vacant = ((*intCode == 0x0000) && (*(intCode+1) == 0x0000)) ||
-                  ((*intCode == 0xF815) && (*(intCode+1) == 0xF000));
-
-    if ( ! vacant ) {
-      // If we try to connect to the secondary packet driver and it fails,
-      // don't fall back automatically to the primary one.  It should not fail.
-      if ( Packet_init( packetInt2 ) == 0 ) { selectedPacketInt = packetInt2; }
-    } else {
-      // A secondary is specified but not enabled yet; use the primary.
-      if ( Packet_init( packetInt ) == 0 ) { selectedPacketInt = packetInt; }
-    }
-
+  // Try the first packet driver interrupt
+  if ( Packet_init( packetInt ) == 0 ) {
+    selectedPacketInt = packetInt;
   } else {
-    if ( Packet_init( packetInt ) == 0 ) { selectedPacketInt = packetInt; }
+    // Is there a second to try?
+    if ( (packetInt2 != 0) && Packet_init( packetInt2 ) == 0 ) {
+      selectedPacketInt = packetInt2;
+    }
   }
 
   if ( selectedPacketInt == 0 ) {
-    fprintf( stderr, InitErrorMsg,
-             "packet driver, are the configured interrupts correct?"
+    fprintf( stderr, "Init: Could not setup packet driver, are the configured interrupts correct?\n"
              "  Configured packet driver interrupt: 0x%X\n", packetInt );
     if ( packetInt2 ) {
       fprintf( stderr, "  Configured NetDrive shim interrupt: 0x%X\n", packetInt2 );
@@ -982,7 +964,7 @@ int8_t Utils::initStack( uint8_t tcpSockets,
 // Do the opposite of initStack - terminate things in the correct order.  This
 // should always be safe to call, even from within initStack.
 
-void Utils::endStack2( bool ignoreTracing ) {
+void Utils::endStack( void ) {
 
   // Set the number of free incoming buffers for packets to zero so that the
   // packet driver can not give us any more work to do.  (All incoming packets
@@ -1047,9 +1029,7 @@ void Utils::endStack2( bool ignoreTracing ) {
 
   // If any form of tracing was active then write the final stats out.
   #ifndef NOTRACE
-  if ( ignoreTracing == false ) {
-    if ( Trace_Debugging ) dumpStats( Trace_Stream );
-  }
+  if ( Trace_Debugging ) dumpStats( Trace_Stream );
   #endif
 
 
@@ -1058,12 +1038,22 @@ void Utils::endStack2( bool ignoreTracing ) {
   }
 
 
-  if ( ignoreTracing == false ) {
-    Trace_endTracing( );
-  }
+  Trace_endTracing( );
 
   fflush( NULL );
 }
+
+
+void Utils::processPackets( void ) {
+  PACKET_PROCESS_SINGLE;
+  #ifdef COMPILE_TCP
+  Tcp::drivePackets( );
+  #endif
+  #ifdef COMPILE_ARP
+  Arp::driveArp( );
+  #endif
+};
+
 
 
 void Utils::dumpStats( FILE *stream ) {
@@ -1085,28 +1075,6 @@ void Utils::dumpStats( FILE *stream ) {
   Packet_dumpStats( stream );
 
 };
-
-
-
-uint32_t Utils::timeDiff( struct dostime_t startTime, struct dostime_t endTime ) {
-
-  uint32_t rc;
-  uint32_t st = startTime.hsecond + startTime.second * 100l +
-                startTime.minute * 6000l + startTime.hour * 360000l;
-
-  uint32_t et = endTime.hsecond + endTime.second * 100l +
-                endTime.minute * 6000l + endTime.hour * 360000l;
-
-  if ( et < st ) {
-    rc = (et + 8640000l) - st;
-  }
-  else {
-    rc = et - st;
-  }
-
-  return rc;
-}
-
 
 
 

@@ -1,7 +1,7 @@
 /*
 
    mTCP Ping.cpp
-   Copyright (C) 2009-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -29,20 +29,11 @@
    2011-05-27: Initial release as open source software
    2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
    2015-02-03: Code cleanup
+   2026-09-07: Change to read the 8253 counter instead of reprogramming it.
 
 */
 
 
-// A simple Ping utility.  This one was a nightmare to code because it
-// requires much higher resolution on the timer than BIOS normally gives
-// us.  There is some code to reprogram the hardware timer to tick faster
-// and a new interrupt handler that only calls the BIOS timer tick every
-// so often to preserve the correct view of time at the BIOS level.
-//
-// Using this trick we can get sub millisecond accuracy out of the slowest
-// machines, which is a nice trick.  And it is much better than trying to
-// code processor dependent delay loops, which don't work anyway.
-//
 // Return codes
 //   0 - All good, and all sent packets received a response
 //   1 - Usage error
@@ -66,13 +57,16 @@
 #include "udp.h"
 #include "dns.h"
 #include "timer.h"
+#include "trace.h"
 
 
+#define PACKET_COUNT_DEFAULT    (4)
+#define PACKET_PAYLOAD_DEFAULT (32)
 
 char    *ServerName;
 IpAddr_t ServerAddr;
-uint16_t PacketCount = 4;
-uint16_t PacketPayload = 32;
+uint16_t PacketCount = PACKET_COUNT_DEFAULT;
+uint16_t PacketPayload = PACKET_PAYLOAD_DEFAULT;
 
 uint16_t TimeoutSecs = 1;
 
@@ -81,7 +75,10 @@ bool Audible = false;
 uint16_t PacketsSent = 0;
 uint16_t RepliesReceived = 0;
 uint16_t RepliesLost = 0;
+
 uint32_t ReplyTime = 0;
+uint32_t ReplyMin = 0xffffffff;
+uint32_t ReplyMax = 0;
 
 uint16_t icmpLen;
 
@@ -113,6 +110,7 @@ IpAddr_t LastIp = { 0, 0, 0, 0 };
 
 // Function prototypes
 
+void timerModeDetector( void );
 void icmpHandler( const unsigned char *packet, const IcmpHeader *icmp );
 void sendAndWait( void );
 void parseArgs( int argc, char *argv[] );
@@ -120,74 +118,8 @@ void shutdown( int rc );
 
 
 
-volatile uint32_t ping_ticks2 = 0;
-volatile uint16_t ping_ticks = 0;
 
-
-void ( __interrupt __far *ping_old_tick_handler)( );
-
-void __interrupt __far ping_tick_handler( )
-{
-  ping_ticks2++;
-
-  ping_ticks++;
-  if ( ping_ticks == 63 ) {
-    ping_ticks = 0;
-    _chain_intr( ping_old_tick_handler );
-  }
-  else {
-    outportb( 0x20, 0x20 );
-  }
-}
-
-
-
-void ping_hook( void ) {
-
-  disable_ints( );
-
-  ping_old_tick_handler = getvect( 0x08 );
-  setvect( 0x08, ping_tick_handler );
-
-  // Tell the 8253 that we want to use Mode 3 on timer 0.
-  // The counter will start at 0x400 and count down to 0
-  // instead of the usual 0xFFFF, which makes it 64 times
-  // faster than usual.
-
-  _asm {
-    mov al, 0x36
-    out 0x43, al
-    mov al, 0x00
-    out 0x40, al
-    mov al, 0x04
-    out 0x40, al
-  }
-
-  enable_ints( );
-}
-
-void ping_unhook( void ) {
-
-  disable_ints( );
-
-  _asm {
-    mov al, 0x36
-    out 0x43, al
-    mov al, 0xFF
-    out 0x40, al
-    mov al, 0xFF
-    out 0x40, al
-  }
-
-  setvect( 0x08, ping_old_tick_handler );
-
-  enable_ints( );
-}
-
-
-
-
-static char *CopyrightMsg= "\nmTCP Ping by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2025\nVersion: " __DATE__ "\n";
+static char *CopyrightMsg= "\nmTCP Ping by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2026\nVersion: " __DATE__ "\n";
 
 
 int main( int argc, char *argv[] ) {
@@ -209,24 +141,16 @@ int main( int argc, char *argv[] ) {
     exit( 1 );
   }
 
-
-  // Hook the timer interrupt to reprogram it for higher precision.  This will
-  // not affect the rate at which the BIOS tick happens.
-
-  ping_hook( );
-
-
   // From this point forward you have to call the shutdown( ) routine to
-  // exit because we have the timer interrupt hooked.  It is actually hooked
-  // twice; once by TCP/IP and then by this code.
+  // exit because we have the timer interrupt hooked.
 
+  timerModeDetector( );
 
   // Start resolving the name.
   Dns::resolve( ServerName, ServerAddr, 1 );
 
   while ( !CtrlBreakDetected && Dns::isQueryPending( ) ) {
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
+    Utils::processPackets( );
     Dns::drivePendingQuery( );
   }
 
@@ -303,8 +227,7 @@ int main( int argc, char *argv[] ) {
       break;
     }
 
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
+    Utils::processPackets( );
 
     arpRc = icmpEchoPacket.ip.setDestEth( icmpEchoPacket.eh.dest );
 
@@ -344,11 +267,11 @@ int main( int argc, char *argv[] ) {
 
   if ( RepliesReceived ) {
 
-    uint16_t big = ((ReplyTime * 85 ) / RepliesReceived) / 100;
-    uint16_t small = ((ReplyTime * 85) / RepliesReceived) % 100;
+    uint32_t big = ( ReplyTime / RepliesReceived ) / 10lu;
+    uint32_t small = ( ReplyTime / RepliesReceived ) % 10;
 
-    printf( "Average time for a reply: %u.%02u ms (not counting lost packets)\n",
-            big, small );
+    printf( "Round trip time min / avg / max = %lu.%01lu / %lu.%01lu / %lu.%01lu\n",
+             ReplyMin/10, ReplyMin%10, big, small, ReplyMax/10, ReplyMax%10 );
   }
 
   int rc = 4;
@@ -363,6 +286,36 @@ int main( int argc, char *argv[] ) {
   return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+//
+// Timer stuff
+//
+// Instead of reprogramming the timer to increment the BIOS tick faster and
+// counting those fast ticks, directly read the timer again.  This is nicer
+// because we don't have to reprogram the 8253 or hook the hardware timer
+// interrupt, and we can still get great precision.  (Even better than our
+// previous code, which with reprogramming the timer was only getting 0.85ms
+// granularity.
+
+
+// These constants assume the machine is using 8253 timer mode 2.
+
+uint16_t TimerOneMs = TIMER_8253_ONE_MS;
+uint16_t TimerTenthMs = TIMER_8253_ONE_MS / 10;
+
+void timerModeDetector( void ) {
+
+  int modeDetected = Timer_modeDetector( );
+
+  if ( modeDetected == 3 ) {
+    TimerTenthMs = TimerTenthMs << 1;
+    TimerOneMs = TimerOneMs << 1;
+  }
+
+  TRACE(("Ping: Timer mode %d detected\n", modeDetected));
+
+}
 
 
 
@@ -395,7 +348,6 @@ void icmpHandler( const unsigned char *packet, const IcmpHeader *icmp ) {
 }
 
 
-
 void sendAndWait( ) {
 
   PacketsSent++;
@@ -409,36 +361,52 @@ void sendAndWait( ) {
   // bigger than 60 bytes.
   Packet_send_pkt( &icmpEchoPacket, icmpLen + sizeof(EthHeader) + sizeof(IpHeader) );
 
-  uint32_t startTime = ping_ticks2;
-  uint32_t startBios = TIMER_GET_CURRENT( );
+  // Precompute the timeout value to avoid an expensive 32 multiply each
+  // time through the loop.  It needs to be 32 bits because 16 bits only covers
+  // up to 6 seconds.
+  uint32_t timeout_10ths = TimeoutSecs * 10000l;
+
+  uint32_t tenths_ms = 0;
+  uint16_t startTime = readTimer_8253( );
 
   while ( 1 ) {
 
     if ( CtrlBreakDetected ) return;
 
-    PACKET_PROCESS_SINGLE;
+    Utils::processPackets( );
+
+    uint16_t c = readTimer_8253( );
+    uint16_t e = startTime - c;
+
+    // More than one tenth of a millisecond?
+    if ( e > (TimerTenthMs) ) {
+
+      while ( e > TimerTenthMs ) {
+        tenths_ms += 1;
+        e = e - (TimerTenthMs);
+      }
+
+      // Add the remainder back onto the starting time so we include it next time.
+      startTime = c + e;
+
+    }
 
     if ( ResponseReceived ) {
 
-      uint32_t elapsedTicks = ping_ticks2 - startTime;
-
-      // float elapsed = elapsedTicks * 0.858209;
-      uint16_t elapsedMs = (elapsedTicks * 85) / 100;
-      uint16_t elapsedSmall = (elapsedTicks * 85) % 100;
-
-      printf( "Packet sequence number %u received from %u.%u.%u.%u in %u.%02u ms, ttl=%u\n",
+      printf( "Packet sequence number %u received from %u.%u.%u.%u in %lu.%01lu ms, ttl=%u\n",
               ntohs( icmpEchoPacket.seq ),
               LastIp[0], LastIp[1], LastIp[2], LastIp[3],
-              elapsedMs, elapsedSmall, LastTTL );
+              tenths_ms/10, tenths_ms%10, LastTTL );
 
       RepliesThisIteration++;
       RepliesReceived++;
-      ReplyTime += elapsedTicks;
+      ReplyTime += tenths_ms;
+      if ( ReplyMin > tenths_ms ) ReplyMin = tenths_ms;
+      if ( ReplyMax < tenths_ms ) ReplyMax = tenths_ms;
 
       // Playing this sound costs 50ms, so be careful where you place this code.
       if (Audible) { sound(500); delay(50); nosound( ); }
 
-      startBios = TIMER_GET_CURRENT( );
       ResponseReceived = 0;
     }
 
@@ -447,7 +415,7 @@ void sendAndWait( ) {
     // get a response so we break the loop one second after the last response
     // appears, or after one second if no responses appear.
 
-    if ( (TIMER_GET_CURRENT( ) - startBios ) > (18*TimeoutSecs) ) {
+    if ( tenths_ms > timeout_10ths ) {
 
       if ( RepliesThisIteration == 0 ) {
         printf( "Packet sequence number %u: timeout!\n", ntohs( icmpEchoPacket.seq ) );
@@ -464,13 +432,14 @@ void sendAndWait( ) {
 
 
 void usage( void ) {
-  puts( "\nping [options] <ipaddr>\n\n"
+  printf( "\nping [options] <ipaddr>\n\n"
         "Options:\n"
         "  -help        Shows this help\n"
         "  -a           Audible ping\n"
-        "  -count <n>   Number of packets to send, default is 4\n"
-        "  -size <n>    Size of ICMP payload to send, default is 32\n"
-        "  -timeout <n> Number of seconds to wait for a response packet" );
+        "  -count <n>   Number of packets to send, default is %u\n"
+        "  -size <n>    Size of ICMP payload to send, default is %u, max is %u\n"
+        "  -timeout <n> Number of seconds to wait for a response packet\n",
+        PACKET_COUNT_DEFAULT, PACKET_PAYLOAD_DEFAULT, ICMP_ECHO_OPT_DATA);
   exit( 1 );
 }
 
@@ -542,7 +511,6 @@ void parseArgs( int argc, char *argv[] ) {
 
 
 void shutdown( int rc ) {
-  ping_unhook( );
   Utils::endStack( );
   exit( rc );
 }

@@ -1,7 +1,7 @@
 /*
 
    mTCP Timer.cpp
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -71,8 +71,8 @@ extern volatile clockTicks_t Timer_CurrentTicks = 0;
 static uint8_t timer_hooked = 0;
 
 // Short duration countdown timer data
-static uint16_t *countdownTimers[10];  // List of timers
-static uint16_t  activeTimers = 0;     // Number of active timers
+static uint16_t *countdownTimers[TIMER_MANAGED_SLOTS];  // List of timers
+static uint16_t  activeTimers = 0;                      // Number of active timers
 
 // Pointer to the timer tick handler that we are chaining to.
 // This is the one we will restore when we are done.
@@ -119,19 +119,28 @@ void Timer_stop( void ) {
 //
 // It's safe to add a timer without disabling interrupts, as the new
 // timer is just appended to the end of the list and at worst case
-// it will be missed once.  But when removing a timer disable
-// interrupts.
+// it will be missed once.  But when removing a timer disable interrupts.
 
 void Timer_manageTimer( uint16_t *p ) {
-  if (activeTimers < 10) {
+
+  if (activeTimers < TIMER_MANAGED_SLOTS) {
+
+    for ( int i=0; i < activeTimers; i++ ) {
+      if ( countdownTimers[i] == p ) {
+        // Don't do anything; it is already in the list.  This is a user error.
+        return;
+      }
+    }
+
     countdownTimers[activeTimers] = p;
     activeTimers++;
   }
+
 }
 
 void Timer_stopManagingTimer( uint16_t *p ) {
   disable_ints( );
-  for ( int i=0; i < activeTimers++; i++ ) {
+  for ( int i=0; i < activeTimers; i++ ) {
     if ( countdownTimers[i] == p ) {
       // Take the last timer and move it into this slot.
       countdownTimers[i] = countdownTimers[activeTimers-1];
@@ -142,3 +151,62 @@ void Timer_stopManagingTimer( uint16_t *p ) {
 }
 
 
+
+
+#ifdef TIMER_8253_SUPPORT
+
+int Timer_modeDetector( void ) {
+
+  // Wait for a new BIOS timer tick and read the 8253.  After that keep
+  // re-reading it, and note every time TIMER_1MS passes on the counter.
+  //
+  // In mode 2 it should be around 55 occurrences of that, which matches
+  // the 55ms of the BIOS timer tick.
+  //
+  // In mode 3 the counter appears to move twice as fast so we will see
+  // the counter move far more than 55 times.
+
+  uint8_t far *BIOSTicks = (uint8_t far *)MK_FP( 0x40, 0x6C );
+
+  uint8_t startBIOS = *BIOSTicks;
+
+  while ( startBIOS == *BIOSTicks ) { }
+
+  startBIOS = *BIOSTicks;
+
+  // Start counting ms
+  uint16_t ms = 0;
+  uint16_t startTime = readTimer_8253( );
+
+  while ( startBIOS == *BIOSTicks ) {
+
+    uint16_t c = readTimer_8253( );
+    uint16_t e = startTime - c;
+
+    if ( e > TIMER_8253_ONE_MS ) {
+      while ( e > TIMER_8253_ONE_MS ) {
+        ms += 1;
+        e = e - (TIMER_8253_ONE_MS);
+      }
+      startTime = c + e;
+    }
+
+  }
+
+
+  // In mode 2 we should get around 55 time tickers, plus or minus a few.
+  // In mode 3 we will think we saw nearly 110 timer ticks.
+
+  // printf("ReadTimerMode: %02x\n", readTimerMode_8254( ));
+  // printf("Timer mode detector: detected %u 1ms increments\n", ms );
+
+  int modeDetected = 2;
+
+  if ( ms > 70 ) {
+    modeDetected = 3;
+  }
+
+  return modeDetected;
+}
+
+#endif

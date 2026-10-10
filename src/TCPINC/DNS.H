@@ -1,7 +1,7 @@
 /*
 
    mTCP Dns.H
-   Copyright (C) 2008-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -223,10 +223,6 @@ class Dns {
     static DNS_Pending_Rec_t pendingQuery;
 
     static uint16_t handlerPort;
-
-    static void scanHostsFile( const char *target1,
-                               const char *target2,
-                               IpAddr_t result );
 
   public:
 

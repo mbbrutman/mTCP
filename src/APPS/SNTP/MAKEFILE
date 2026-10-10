@@ -35,6 +35,9 @@ objs = sntp.obj
 
 all : clean sntp.exe
 
+install : .symbolic
+	@copy sntp.exe ..\..\execs
+
 clean : .symbolic
   @del sntp.exe
   @del *.obj

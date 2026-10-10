@@ -41,6 +41,9 @@ objs = spdtest.obj
 
 all : clean spdtest.exe
 
+install : .symbolic
+	@copy spdtest.exe ..\..\execs
+
 clean : .symbolic
   @del spdtest.exe
   @del *.obj

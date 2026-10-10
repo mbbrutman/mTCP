@@ -1,7 +1,7 @@
 /*
 
    mTCP SpdTest.cpp
-   Copyright (C) 2011-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -93,6 +93,7 @@
 
 #include "types.h"
 
+#include "timer.h"
 #include "trace.h"
 #include "utils.h"
 #include "packet.h"
@@ -186,7 +187,7 @@ void __interrupt __far ctrlBreakHandler( ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP SpeedTest by M Brutman (mbbrutman@gmail.com) (C)opyright 2010-2025\n";
+static char CopyrightMsg1[] = "mTCP SpeedTest by M Brutman (mbbrutman@gmail.com) (C)opyright 2010-2026\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 int main( int argc, char *argv[] ) {
@@ -261,7 +262,11 @@ int main( int argc, char *argv[] ) {
             serverPort, Port );
 
     mySocket = TcpSocketMgr::getSocket( );
+
+    #ifdef RECV_INTERFACE
     mySocket->setRecvBuffer( RECV_BUF_SIZE );
+    #endif
+
     rc = mySocket->connect( Port, serverAddr, serverPort, 10000 );
   }
   else {
@@ -316,9 +321,7 @@ int main( int argc, char *argv[] ) {
     shutdown( -1 );
   }
 
-
-  DosTime_t start;
-  gettime( &start );
+  clockTicks_t startTime = TIMER_GET_CURRENT( );
 
 
   // Even though we have a local MTU that sets the largest packet size we can
@@ -491,7 +494,7 @@ int main( int argc, char *argv[] ) {
       SpeedTestBytes -= chunkLen;
       TotalBytesSent += chunkLen;
 
-      buf->b.dataLen = chunkLen;
+      buf->b.setDataLen( chunkLen );
 
       int16_t rc = mySocket->enqueue( &buf->b );
       if ( rc ) {
@@ -510,16 +513,14 @@ int main( int argc, char *argv[] ) {
 
   TcpSocketMgr::freeSocket( mySocket );
 
-  DosTime_t endTime;
-  gettime( &endTime );
-
 
   // Compute stats
 
-  uint16_t t = Utils::timeDiff( start, endTime );
+  uint32_t elapsedMs = uint32_t(TIMER_GET_CURRENT() - startTime) * 55;
+  uint32_t elapsedSecs = elapsedMs / 1000;
 
-  printf( "Elapsed time: %u.%03u, Bytes sent: %lu, Received: %lu\n",
-          (t/100), (t%1000), TotalBytesSent, TotalBytesReceived );
+  printf( "Elapsed time: %lu.%03lu, Bytes sent: %lu, Received: %lu\n",
+          elapsedSecs, (elapsedMs%1000), TotalBytesSent, TotalBytesReceived );
 
   #ifndef RECV_INTERFACE
     if ( packetsDequeued ) {

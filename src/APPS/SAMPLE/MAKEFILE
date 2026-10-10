@@ -39,6 +39,9 @@ objs = sample.obj
 
 all : clean sample.exe
 
+install : .symbolic
+	@copy sample.exe ..\..\execs
+
 clean : .symbolic
   @del sample.exe
   @del *.obj

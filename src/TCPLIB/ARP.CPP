@@ -1,7 +1,7 @@
 /*
 
    mTCP Arp.cpp
-   Copyright (C) 2005-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -59,6 +59,8 @@ uint16_t Arp::pendingEntries = 0;
 Arp::Rec_t Arp::arpTable[ARP_MAX_ENTRIES];
 uint16_t Arp::entries = 0;
 
+bool Arp::pointToPointInUse = false;
+uint8_t Arp::reserved = 0;
 
 uint32_t Arp::RequestsReceived = 0;
 uint32_t Arp::RepliesReceived = 0;
@@ -77,16 +79,9 @@ void Arp::dumpStats( FILE *stream ) {
 
 
 
-// We're going to send an ARP response for our MAC/IP
-// address fairly often, so pre-build what we can first.
-// To avoid any possible concurrency issue, these packets
-// will serve as templates and will be copied to local
-// storage when in use.  These original packets should not
-// be used directly.
-//
-// 2006-12-21: On second thought, we don't really send that
-// many ARP packets.  If you want to cut down on space and
-// code, ditch the pre-built responses.
+// Define a prebuilt response and request template that you can copy to local
+// storage and the populate as needed.  This is less expensive than trying to
+// set every field every time you need to send a response or a request.
 
 typedef struct {
   EthHeader eh;
@@ -94,13 +89,17 @@ typedef struct {
   char      padding[18];  // Packet has to be at least 60 bytes
 } ArpPacket_t;
 
-ArpPacket_t Arp_prebuiltResponse;
-ArpPacket_t Arp_prebuiltRequest;
+ArpPacket_t Arp_prebuiltResponse = {
+  {{0,0,0,0,0,0}, {0,0,0,0,0,0}, 0x0608},
+  {0x0100, 0x0008, 6, 4, 0x0200, {0,0,0,0,0,0}, {0,0,0,0}, {0,0,0,0,0,0}, {0,0,0,0}},
+  {"mTCP by M Brutman"}
+};
 
-
-
-
-static char VanityString[] = "mTCP by M Brutman";
+ArpPacket_t Arp_prebuiltRequest = {
+  {{0xff,0xff,0xff,0xff,0xff,0xff}, {0,0,0,0,0,0}, 0x0608},
+  {0x0100, 0x0008, 6, 4, 0x0100, {0,0,0,0,0,0}, {0,0,0,0}, {0xff,0xff,0xff,0xff,0xff,0xff}, {0,0,0,0}},
+  {"mTCP by M Brutman"}
+};
 
 
 void Arp::init( void ) {
@@ -111,48 +110,28 @@ void Arp::init( void ) {
   // addr.  We'll just make a dummy entry, as the actual MAC addr does
   // not matter.
 
-  char *slip = getenv( "MTCPSLIP" );
-  if ( slip != NULL ) {
+  if ( getenv("MTCPSLIP") != NULL ) {
     Ip::copy( arpTable[0].ipAddr, Gateway );
     Eth::copy( arpTable[0].ethAddr, Eth::Eth_Broadcast );
     arpTable[0].updated = time( NULL );
     entries++;
+    pointToPointInUse = true;
   }
 
-  // Initialize the pre-built Arp response packet
-  // Don't call this unless we know our IP address and Eth address.
+  // Initialize the pre-built Arp response and request packets.
+  // Do this after you know your IP and Ethernet addresses.
+  //
+  // Fields not explicitly initialized here are statically initialized
+  // and do not change.
 
   Arp_prebuiltResponse.eh.setSrc( MyEthAddr );
-  Arp_prebuiltResponse.eh.setType( 0x0806 );
-
-  Arp_prebuiltResponse.ah.hardwareType = ntohs( 1 );
-  Arp_prebuiltResponse.ah.protocolType = ntohs( 0x0800 );
-  Arp_prebuiltResponse.ah.hlen = 6;
-  Arp_prebuiltResponse.ah.plen = 4;
-  Arp_prebuiltResponse.ah.operation = htons( 2 );
   Eth::copy( Arp_prebuiltResponse.ah.sender_ha, MyEthAddr );
   Ip::copy(  Arp_prebuiltResponse.ah.sender_ip, MyIpAddr );
 
-  strcpy( Arp_prebuiltResponse.padding, VanityString );  // 18 bytes including the NULL
-
-
-  // Initialize the pre-built Arp request packet.
-
-  Arp_prebuiltRequest.eh.setDest( Eth::Eth_Broadcast );
   Arp_prebuiltRequest.eh.setSrc( MyEthAddr );
-  Arp_prebuiltRequest.eh.setType( 0x0806 );
-
-  Arp_prebuiltRequest.ah.hardwareType = ntohs( 1 );
-  Arp_prebuiltRequest.ah.protocolType = ntohs( 0x0800 );
-  Arp_prebuiltRequest.ah.hlen = 6;
-  Arp_prebuiltRequest.ah.plen = 4;
-  Arp_prebuiltRequest.ah.operation = htons( 1 );
-
   Eth::copy( Arp_prebuiltRequest.ah.sender_ha, MyEthAddr );
   Ip::copy( Arp_prebuiltRequest.ah.sender_ip, MyIpAddr );
-  Eth::copy( Arp_prebuiltRequest.ah.target_ha, Eth::Eth_Broadcast );
 
-  strcpy( Arp_prebuiltRequest.padding, VanityString );  // 18 bytes including the NULL
 }
 
 
@@ -432,7 +411,7 @@ void Arp::sendArpRequest( IpAddr_t target_ip ) {
   // Too many pending requests?
 
   if (pendingEntries == ARP_MAX_PENDING ) {
-    TRACE_ARP_WARN(( "Arp: Too many pending entries: %d\n", pendingEntries ));
+    TRACE_ARP_WARN(( "Arp: Too many pending requests: %d\n", pendingEntries ));
     return;
   }
 
@@ -458,18 +437,18 @@ void Arp::sendArpRequest( IpAddr_t target_ip ) {
 
 void Arp::sendArpRequest2( IpAddr_t target_ip ) {
 
-  // Send the request
+  // Copy the template, customize it, then send it out on the wire.
 
-  ArpPacket_t arpRequest;
-
-  arpRequest = Arp_prebuiltRequest;
+  ArpPacket_t arpRequest = Arp_prebuiltRequest;
 
   Ip::copy( arpRequest.ah.target_ip, target_ip );
 
-  Packet_send_pkt( &arpRequest, sizeof( arpRequest ) );
-
-  TRACE_ARP(( "Arp: Sent req for %d.%d.%d.%d\n",
+  TRACE_ARP(( "Arp: Sending req for %d.%d.%d.%d\n",
           target_ip[0], target_ip[1], target_ip[2], target_ip[3] ));
+
+  if ( pointToPointInUse == false ) {
+    Packet_send_pkt( &arpRequest, sizeof( arpRequest ) );
+  }
 
 }
 
@@ -477,21 +456,24 @@ void Arp::sendArpRequest2( IpAddr_t target_ip ) {
 
 void Arp::sendArpResponse( ArpHeader *ah ) {
 
-  ArpPacket_t arpResponse;
+  // Copy the template, customize it, then send it out on the wire.
 
-  arpResponse = Arp_prebuiltResponse;
+  ArpPacket_t arpResponse = Arp_prebuiltResponse;
 
   arpResponse.eh.setDest( ah->sender_ha );
   Eth::copy( arpResponse.ah.target_ha, ah->sender_ha );
   Ip::copy(  arpResponse.ah.target_ip, ah->sender_ip );
 
+  TRACE_ARP(( "Arp: Sending reply to %d.%d.%d.%d\n",
+          ah->sender_ip[0], ah->sender_ip[1],
+          ah->sender_ip[2], ah->sender_ip[3] ));
+
+  // I'm not doing the point to point check here ...  if somebody sense
+  // us an ARP request we assume that we should respond.  This won't
+  // happen on a point to point connection.
   Packet_send_pkt( &arpResponse, sizeof( arpResponse ) );
 
   RepliesSent++;
-
-  TRACE_ARP(( "Arp: Sent reply to %d.%d.%d.%d\n",
-          ah->sender_ip[0], ah->sender_ip[1],
-          ah->sender_ip[2], ah->sender_ip[3] ));
 
 }
 

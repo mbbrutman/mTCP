@@ -1,7 +1,7 @@
 /*
 
    mTCP Inlines.H
-   Copyright (C) 2006-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -359,6 +359,8 @@ extern bool biosIsKeyReady( void );
   modify [ax bh]       \
   value [bh];
 
+// Returns scan code in AH, ASCII char in AL (or 0 if a special key)
+
 extern uint16_t biosKeyRead( void );
 #pragma aux biosKeyRead = \
   "mov ah, 0x0"        \
@@ -379,17 +381,107 @@ extern uint16_t biosKeyRead( void );
 
 extern void fillUsingWord( void far * target, uint16_t fillWord, uint16_t len );
 #pragma aux fillUsingWord = \
-  "push es"    \
-  "push di"    \
-  "mov es, dx" \
-  "mov di, bx" \
   "rep stosw"  \
-  "pop di"     \
-  "pop es"     \
-  modify [ax]  \
-  parm [dx bx] [ax] [cx]
+  modify [cx es di]  \
+  parm [es di] [ax] [cx]
 
 #endif
+
+
+
+// Generic input byte and output byte for ports
+
+extern void outPortB( uint16_t p, uint8_t b );
+#pragma aux outPortB = \
+  "out dx, al" \
+  parm [dx] [al];
+
+
+extern uint8_t inPortB( uint16_t p );
+#pragma aux inPortB = \
+  "in al, dx"  \
+  parm [dx]    \
+  modify [al];
+
+
+
+// getCPUType
+//
+// Returns 0 if 8088/80186 class, 1 if 80286 class, 2 if 80386, or 3 if 80486 or better.
+// Adapted from https://www.rcollins.org/ddj/Sep96/Sep96.html
+extern int getCPUType( void ) ;
+#pragma aux getCPUType =   \
+  "push sp"             \
+  "pop  ax"             \
+  "cmp  ax, sp"         \
+  "jz   try286"         \
+  "xor  ax, ax"         \
+  "jmp  cpuTypeDone"    \
+  "try286:"             \
+  "pushf"               \
+  "or   ax, 0xf000"     \
+  "push ax"             \
+  "popf"                \
+  "pushf"               \
+  "pop  ax"             \
+  "popf"                \
+  "and  ax,0xf000"      \
+  "jnz  is386OrLater"   \
+  "mov  ax, 1"          \
+  "jmp  cpuTypeDone"    \
+  "is386OrLater:"       \
+  ".386"                \
+  "pushfd"              \
+  "pop  eax"            \
+  "mov  ecx, eax"       \
+  "xor  eax, 0x40000"   \
+  "push eax"            \
+  "popfd"               \
+  "pushfd"              \
+  "pop  eax"            \
+  "xor  eax, ecx"       \
+  "mov  ax, 2"          \
+  "jz   cpuTypeDone"    \
+  "push ecx"            \
+  "popfd"               \
+  ".8086"               \
+  "mov ax, 3"           \
+  "cpuTypeDone:"        \
+  modify [ax cx]        \
+  value [ax];
+
+
+// Read the 8253/8254 counter and return it as a uint16_t.
+//
+extern uint16_t readTimer_8253( void );
+#pragma aux readTimer_8253 = \
+  "pushf" \
+  "cli" \
+  "xor   al, al" \
+  "out   0x43, al" \
+  "in    al, 0x61" \
+  "in    al, 0x40" \
+  "xchg  al, ah" \
+  "in    al, 0x61" \
+  "in    al, 0x40" \
+  "popf" \
+  "xchg  al, ah" \
+  modify [ax dx] \
+  value [ax];
+
+
+// Don't bother using this - it is only good on an 8254.  I have it here for
+// debugging.
+
+extern uint8_t readTimerMode_8254( void );
+#pragma aux readTimerMode_8254 = \
+  "pushf" \
+  "cli" \
+  "mov   al, 0xe2"   \
+  "out   0x43, al  " \
+  "in    al, 0x40"   \
+  "popf"             \
+  value [al];
 
 
 

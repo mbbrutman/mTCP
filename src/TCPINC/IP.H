@@ -1,7 +1,7 @@
 /*
 
    mTCP Ip.H
-   Copyright (C) 2005-2025 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2026 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -291,7 +291,7 @@ class Ip {
 #ifdef COMPILE_ICMP
 
 static_assert( ICMP_ECHO_OPT_DATA >= 32 );
-static_assert( ICMP_ECHO_OPT_DATA <= 256 );
+static_assert( ICMP_ECHO_OPT_DATA <= 1024 );
 
 
 #include "Eth.h"
