@@ -2,11 +2,16 @@
 
 Home page: http://www.brutman.com/mTCP/mTCP.html
 
-## Welcome to the mTCP source code!
+## Welcome mTCP!
 
-This is the official github repository for the mTCP project. While I prefer to distribute the source code as a ZIP file, I also
-recognize that people are using github for their projects and they want a github repository to reference or fork from so that
-they can keep up with changes.
+This mTCP project is a TCP/IP library and applications for older IBM compatible personal computers
+running DOS.  The applications include a DHCP client, FTP client and server, HTTP server, an IRC
+client, NetCat (TCP only), mTCP NetDrive (network attached storage for DOS), Ping, and SNTP client,
+and a Telnet client.  See the home page for details.
+
+This is the official github repository for the project. While I prefer to distribute the source code
+as a ZIP file on the home page I also recognize that people are using github for their projects and
+they want a github repository to reference or fork from so that they can keep up with changes.
 
 For detailed information on how the source code is structured please see the developers.pdf file. Topics include the directory
 structure, what compiler to use, architecture and design notes, and miscellaneous notes for programming under DOS.
