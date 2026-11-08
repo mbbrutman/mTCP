@@ -43,8 +43,8 @@
 // Function prototypes
 
 int   scanForPacketDrivers( void );
-int   listenForPackets( uint16_t softwareInt );
-int   showPacketDriverStats( uint16_t softwareInt );
+int   listenForPackets( uint8_t softwareInt );
+int   showPacketDriverStats( uint8_t softwareInt );
 void  usage( int rc );
 
 
@@ -151,8 +151,8 @@ int main( int argc, char *argv[] ) {
       usage( PKTTOOL_RC_USAGE_ERROR );
     }
 
-    uint16_t targetSoftwareInt;
-    int scanRc = sscanf( argv[i], "%x", &targetSoftwareInt );
+    uint8_t targetSoftwareInt;
+    int scanRc = sscanf( argv[i], "%hhx", &targetSoftwareInt );
     if ( scanRc != 1 ) {
       puts( "Parse error reading the packet driver software interrupt number.\n"
             "The format is 0xNN where NN are hexadecimal digits.  The usual range\n"
@@ -883,7 +883,7 @@ void genericPacketHandler( uint8_t *packet, uint16_t packetLen ) {
 }
   
 
-int listenForPackets( uint16_t softwareInt ) {
+int listenForPackets( uint8_t softwareInt ) {
 
   if ( OutputFilenameArg != NULL ) {
     OutputFile = fopen( OutputFilenameArg, "w" );
@@ -995,7 +995,7 @@ int listenForPackets( uint16_t softwareInt ) {
 
 
 
-int showPacketDriverStats( uint16_t softwareInt ) {
+int showPacketDriverStats( uint8_t softwareInt ) {
 
   if ( Packet_init( softwareInt ) ) {
     puts( BadPacketDriverErrMsg );
