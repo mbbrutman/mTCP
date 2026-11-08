@@ -165,6 +165,18 @@ extern uint8_t mTCP_releaseTimesliceEnabled;
 }
 
 
+// Use this when you are doing something timing sensitive and the
+// SLEEP call can affect the measurement.
+
+#define PACKET_PROCESS_SINGLE_NO_SLEEP                            \
+{                                                                 \
+  if ( Buffer_first != Buffer_next ) {                            \
+    Packet_process_internal( );                                   \
+  }                                                               \
+  IP_FRAGS_CHECK_OVERDUE( );                                      \
+}
+
+
 
 // Experimental: Useful for figuring out how much heap you are using and
 // how often you call malloc.  But I've not tested all of the programs with

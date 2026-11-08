@@ -373,7 +373,8 @@ void sendAndWait( ) {
 
     if ( CtrlBreakDetected ) return;
 
-    Utils::processPackets( );
+    // This is timing sensitive so only check for new packets and nothing else.
+    PACKET_PROCESS_SINGLE_NO_SLEEP;
 
     uint16_t c = readTimer_8253( );
     uint16_t e = startTime - c;
@@ -411,9 +412,9 @@ void sendAndWait( ) {
     }
 
 
-    // Wait a full second for replies to come in.  Reset the timer each time we
-    // get a response so we break the loop one second after the last response
-    // appears, or after one second if no responses appear.
+    // Wait a full second (or whatever the delay is) for replies to come in.
+    // Reset the timer each time we get a response so we break the loop one
+    // second after the last response appears, or after one second if no responses appear.
 
     if ( tenths_ms > timeout_10ths ) {
 
