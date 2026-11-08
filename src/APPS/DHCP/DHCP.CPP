@@ -586,7 +586,7 @@ int8_t parseEnv( void ) {
     if ( *parmName == 0 ) continue; // Blank line
 
     if ( stricmp( parmName, Parm_PacketInt ) == 0 ) {
-      int rc = sscanf( nextTokenPtr, "%x, %x", &packetInt, &packetInt2 );
+      int rc = sscanf( nextTokenPtr, "%hhx, %hhx", &packetInt, &packetInt2 );
       if ( rc < 1 ) {
         errorParm = Parm_PacketInt;
       }
